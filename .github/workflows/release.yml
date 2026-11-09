@@ -41,7 +41,7 @@ jobs:
         run: |
           ./packaging/windows/build.ps1 -Version $env:VERSION
           wix msi validate (Get-Item dist\*.msi).FullName
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: dist/*
@@ -63,7 +63,7 @@ jobs:
       - name: Firewall self-test (real nftables)
         run: sudo unshare --net ./target/release/pialite-guard selftest-firewall
       - run: packaging/linux/build-packages.sh "$VERSION"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: dist/*
