@@ -1,0 +1,7 @@
+/target
+/dist
+*.msi
+*.wixpdb
+*.log
+*.pem
+.DS_Store

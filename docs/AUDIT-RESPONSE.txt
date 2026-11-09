@@ -1,0 +1,1188 @@
+PIA Lite - responses to the independent reviews
+ROUND 1: PiaLite_Code_Review.md (2026-11-07) -> v0.2
+=====================================================================================
+
+Verdicts: AGREED = finding correct, fixed. PARTLY = correct in substance, fixed in a
+different way or partly. NOTED = acknowledged limit, documented rather than changed.
+All Rust checks below were run on Linux; the Windows code paths were compile-checked
+for x86_64-pc-windows-msvc. Windows runtime behaviour is what Run-Phase5.bat verifies.
+
+P0-01 unauthenticated IPC                AGREED. TCP replaced by named pipe with access list
+      (SYSTEM, Administrators, installing user's SID), FILE_FLAG_FIRST_PIPE_INSTANCE,
+      PIPE_REJECT_REMOTE_CLIENTS, client requires a session-0 server and connects with
+      SECURITY_IDENTIFICATION, 4 concurrent / 5 s / 512 B limits, versioned protocol.
+      Trust-changing commands need an elevated admin (token checked). Same-user malware
+      limit documented (DESIGN.txt 2). guard/src/ipc.rs, common/src/ipc.rs
+P0-02 persistent != boot-time             AGREED. Added FWPM_FILTER_FLAG_BOOTTIME rules
+      (loopback + DHCP + block), installed in a separate step with built-in objects only;
+      status reports whether Windows accepted them. Claims reworded. The boot capture in
+      Run-Phase5.bat (netsh trace persistent) measures the pre-BFE window. firewall.rs
+P0-03 handed-off disconnect                AGREED. Explicit modes: off / startup / always.
+      "always" blocks on any non-Connected or stale state; "startup" is documented as
+      boot/wake-only and the tray + status warn when PIA's kill switch isn't "on".
+      policy.rs + 9 unit tests (incl. connected_then_disconnected, stale/hung monitor).
+P1-04 corrupt config fails open            AGREED. Result-based load, last-good .bak,
+      damaged + no backup + rules installed => keep blocking; durable writes; tested.
+P1-05 hotel restore clears marker on fail  AGREED. Marker cleared only after verified
+      read-back; retried every 30 s; tray warning; uninstall refuses while pending.
+P1-06 hotel not transactional              AGREED. op lock serialises commands; marker
+      written first; each PIA change verified; rollback on every failure; tested.
+P1-07 uptime heuristic                     AGREED. Removed. Service start = rearm.
+P1-08 allowLAN defaults to true            AGREED. Missing/invalid => false (+ error).
+P1-09 NextDNS removed before replacement   AGREED. Staged installer: direct DoH test,
+      NextDNS paused not removed, PIA DNS read back, end-to-end test via
+      test.nextdns.io (status/protocol/profile), automatic rollback, removal is opt-in.
+P1-10 stale monitor                        AGREED. Observations time-stamped; active
+      probe every 10 s with 5 s limit; 30 s staleness => block; fresh probe after wake.
+P1-11 uninstall reports false success      AGREED. Staged, verified, stops + exit 1 on
+      failure, keeps tray/unlock file, never prints "back to normal" unless it is.
+P2-12 IPC exhaustion                       AGREED (see P0-01 limits).
+P2-13 piactl without timeout               AGREED. Shared runner kills after 5/10/20 s.
+P2-14 DoH answer validation                AGREED. content-type, ID 0, QR, question match.
+P2-15 HTTP bounds                          AGREED. Rewritten with cursor + strict bounds;
+      adversarial tests for each case named in the review.
+P2-16 TCP length wrap                      AGREED. > 65535 => SERVFAIL; body cap 65535.
+P2-17 false success in reload/test-dns     AGREED. set-profile/reload errors propagate;
+      installer checks exit codes; test-dns checks source, ID, question, and proves the
+      profile via NextDNS's test page.
+P2-18 undocumented PIA paths               PARTLY. Every write is read back from PIA's
+      settings; PIA version is in the Phase 5 report. applysettings is still used - it
+      is the only way to change these settings without the GUI.
+P2-19 DNS routing unverified               PARTLY. Phase 5 checks the guard's DoH
+      sockets are bound to the tunnel address, the adapter DNS list, and NextDNS's view.
+      Guarantees in DESIGN.txt are conditional on that.
+P2-20 WFP health from memory               AGREED. Filters verified by key every 30 s,
+      repaired on drift (tested with an injected drift); Phase 5 reads them via netsh wfp.
+P2-21 DNS observability                    AGREED. answered/failed/overloaded/malformed,
+      last-ok age, health over last 20.
+P2-22 concurrent config writers            AGREED. Service is the single writer while
+      running; CLI writes only when the service is stopped (admin-only folder).
+P2-23 installer exit codes                 AGREED. Invoke-Native helper, exit codes,
+      .bat reports failure. NOTED: a signed prebuilt binary isn't available for a
+      personal build; the user builds from this source on their own PC.
+P3-24 region cache key                     AGREED. Content revision counter.
+P3-25 connectOnLaunch substring            AGREED. Parsed as JSON, tested.
+P3-26 pending cleared by status events     AGREED. Operation ids; only completion clears.
+P3-27 incremental redraw                   NOTED. Not changed without a profile showing
+      a cost (the review itself advises against premature caching).
+P3-28 duplicated wrappers                  AGREED. pialite-common crate.
+P3-29 no measurements                      AGREED. Phase 5 reports private memory, handles,
+      threads, CPU for every PIA / PIA Lite process.
+P3-30 small items                          AGREED: label validation, reserved label types,
+      mutex failure logged + retried, popup placed on the monitor under the mouse,
+      Fast Startup value saved and restored on uninstall.
+
+Checks run: cargo test --workspace (45 tests), cargo clippy --workspace --all-targets
+-- -D warnings, cargo fmt --check, Windows type-check of all crates, PowerShell static
+checks. Not run here: cargo audit / cargo deny (no advisory DB access in this sandbox).
+
+
+=====================================================================================
+ROUND 2 - response to the follow-up review (N-01 .. N-17, 2026-11-08)   -> v0.3.0
+=====================================================================================
+
+Same verdict words as above. "Windows check" = compiled + clippy for
+x86_64-pc-windows-msvc here; runtime proof on Windows comes from Run-Phase5.bat on
+the user's PC (listed at the end - not claimed yet).
+
+N-01 P0 WFP alternatives ANDed           AGREED. Microsoft's FWPM_FILTER0 docs say
+      conditions are ANDed (OR only on Windows 7). Note: on the user's Windows 11
+      (build 26300) the old rules did behave like OR - PIA connected in 2-9 s while
+      blocked in the Phase 5 block test - but that is undocumented behaviour, so it
+      is fixed anyway. Cond::Apps / Cond::Lan replaced by Cond::App(path),
+      Subnet4, Subnet6: one filter per program and per LAN range, per IP family,
+      order kept (loopback 15 > programs 14 > DHCP 13 > DNS-to-LAN block 12 > LAN 11
+      > block-all 0). MAX_FILTERS 64 -> 128 (key ranges unchanged: +0x00.. persistent,
+      +0x100.. boot). A PIA program Windows can't identify is an error naming it.
+      Tests: one_alternative_per_filter, filter_specs_per_family. Phase 5 now lists
+      conditions per rule from netsh and FAILs if a rule has two values of one field.
+      firewall.rs
+N-02 P0 hotel exit didn't re-arm          AGREED. Policy::stop_hotel(now) re-arms
+      (handed_off=false, rearmed_at=now, no auto-connect); manual stop and timer use
+      the same finish_hotel(): allow-all removed and block verified in Windows ->
+      kill switch restored + read back -> note cleared -> reconnect. Tests:
+      policy hotel_exit_rearms_startup_mode (both paths), guard
+      hotel_exit_reblocks_restores_then_reconnects (fake piactl + settings file:
+      stop by hand OK, stop by hand with restore FAILING, timer; checks blocking at
+      once, allow-all gone, kill-switch write before the reconnect, marker kept on
+      failure). Mutation check: removing the re-arm makes both tests fail.
+      policy.rs, guard.rs
+N-03 P0/P1 missing config fail-open       AGREED. load(): missing OR damaged ->
+      .bak; else rules present -> Recovered(Startup) + visible config_error; Fresh
+      (Off) only for "no file, no backup, no rules". Tests cover missing+backup,
+      missing+rules, damaged+no backup+rules, damaged+bad backup, fresh. Mutation
+      check: the old "missing = fresh" makes the test fail. config.rs
+N-04 P1 GRGW / IU / admin for unlock      AGREED. Approved SID gets 0x100083 (read
+      data, write data, read attributes, synchronize - no FILE_APPEND_DATA =
+      FILE_CREATE_PIPE_INSTANCE); client CreateFileW asks for exactly that. No
+      approved SID -> no unprivileged ACE (IU fallback removed; logged + status
+      field approved_accounts). Weakening commands need an elevated admin: mode
+      down, unlock, hotel start, seen (plus the trust settings as before). Stronger
+      mode and hotel stop don't. The check runs under the op lock (no race). Tray:
+      weakening actions run "pialite-guard.exe <cmd>" via ShellExecuteExW "runas"
+      (UAC prompt), waits, reports exit code / "cancelled". Test matrix in
+      modes_status_and_drift_repair; Windows-side: new `pipe-selftest` command, run
+      by Run-Phase5.bat as a normal user BEFORE it elevates: second pipe instance
+      must be refused, unlock refused, results in the Phase 5 report.
+      Still documented: same-user malware can use the non-admin commands.
+      guard/src/ipc.rs, common/src/ipc.rs, guard.rs, tray app.rs/winutil.rs
+N-05 P1 unbounded FlushFileBuffers        AGREED. Pipe opened FILE_FLAG_OVERLAPPED;
+      every read/write is overlapped with a deadline and CancelIoEx + wait on
+      timeout. Budget per client: 5 s request, 2 s reply hand-over, 3 s to read and
+      hang up (linger = overlapped 1-byte read that ends when the client closes).
+      No FlushFileBuffers anywhere; Drop = DisconnectNamedPipe + CloseHandle. Busy
+      reply in the listener is bounded to 0.2 + 0.2 s. pipe-selftest opens 4 clients
+      that send "status" and never read, then times how long a 5th takes (limit
+      20 s; expected ~3-4 s). guard/src/ipc.rs
+N-06 P1 reconnect after failed restore    PARTLY - a deliberately different
+      fail-closed state, as the review allows. Reconnecting is still done (not
+      reconnecting would leave the user either offline or, in block mode off,
+      online OUTSIDE the VPN), but while the restore is pending the policy is
+      "strict": Startup mode blocks like Always, so the guard enforces what PIA's
+      kill switch no longer does. Marker kept, retried every 30 s, warning in tray
+      and status, hotel start refused, uninstall stops. Block mode off: nothing
+      blocks - the message says so explicitly. Tested (strict_startup_blocks_like_
+      always, guard hotel test). policy.rs, guard.rs
+N-07 P1 installer rollback incomplete     AGREED. Undo journal: each live change
+      (NextDNS paused, PIA DNS changed, DNS pointing at a guard being replaced) is
+      recorded in memory and in C:\ProgramData\PiaLite\install-undo.txt BEFORE it
+      is made. The outer catch undoes ANY failure (not only stage 5), newest first,
+      reconnects, checks a real lookup (Resolve-DnsName), and says "ROLLED BACK" or
+      "ROLLBACK INCOMPLETE". A run cut off halfway is undone at the start of the next
+      install/uninstall. Restart-Vpn returns true/false and checks piactl exit
+      codes; a failed reconnect after the DNS change aborts (-> rollback).
+      Resume-NextDns verifies the service is Running. NOT done: automated failure
+      injection on Windows at every stage (no Windows here) - the code path is one
+      function for all stages. scripts/Install-Guard.ps1
+N-08 P1/P2 boot_ok not a proof            PARTLY. Boot-time filters are now read back
+      after install (by key, or - if Windows only lists them with the boot-time
+      flag - by enumeration with FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY) and checked
+      field by field; boot_ok means "read back as planned", rechecked every 30 s.
+      An empty packet capture is now always INCONCLUSIVE (N-13). Still true and
+      documented: proof of pre-BFE blocking needs a capture that sees packets; on
+      this laptop's Wi-Fi it doesn't, so the firewall audit log is the evidence.
+      Fast Startup / hibernate / IPv6 / other adapters: not tested yet.
+N-09 P2 drift check keys only             AGREED. verify(&[FilterSpec]) reads every
+      filter back: layer, action, flags (incl. disabled), UINT8 weight, sublayer,
+      number of conditions; next key absent; our provider's persistent filters are
+      enumerated (FwpmFilterEnum0) to find extra ones. Stub keeps specs and has
+      tamper_action() (same key, permit/block flipped) - the drift test catches it.
+      Condition VALUES are not compared (count only) - noted.
+N-10 P2 profile mismatch = success        AGREED. test-dns reports encrypted_ok
+      separately from profile_check = match | mismatch | unknown. Mismatch (another
+      ID, or NO profile) fails; an "fp..." fingerprint is "unknown" = NOT confirmed,
+      never true. fully_verified only when match + OS resolver proven. Opt-in proof:
+      --canary DOMAIN (on your Denylist): blocked through the guard AND resolvable
+      via NextDNS without a profile (control). Installer + Phase 5 show the three
+      states; "proves YOUR profile" wording removed. main.rs
+N-11 P2 test bypasses Windows resolver    PARTLY. test-dns now looks up a random
+      one-off name with getaddrinfo (Windows DNS Client, like browsers) and asks the
+      guard ("seen", admin only) whether it arrived; names are kept only as keyed
+      hashes (256, random key per run). "elsewhere" fails the test. Phase 5 finds the
+      tunnel adapter generically (wgpia0, or PIA's TAP/Wintun for OpenVPN). NOT done:
+      browser Secure-DNS checks, OpenVPN/IPv6/network-switch runs - need the user's
+      PC; failing closed on route mismatch is not implemented (PIA's own DNS leak
+      protection covers the tunnel side). proxy.rs, main.rs, Phase5-Tests.ps1
+N-12 P2 uninstall false "complete"        AGREED. Critical steps throw (kill switch,
+      rules, DNS). Missing status during hotel check -> reads the recovery note
+      itself instead of assuming. Leftovers (NextDNS not Running, VPN not back,
+      service marked for deletion / sc error, Fast Startup, folders still present)
+      are collected; "removed completely" only when none; otherwise a list and exit
+      code 3, which Install-PiaLite.ps1 treats as "removed with leftovers". The tray
+      uninstall now checks its folder was really deleted.
+N-13 P2 empty capture = PASS              AGREED. 0 packets -> INCONCLUSIVE (WARN);
+      packets but none of PIA's own (no positive control) -> INCONCLUSIVE; PASS only
+      with PIA's own packets seen and nothing else.
+N-14 P2 mode saved before enforced        AGREED. set_mode applies in Windows first,
+      saves after; on either failure policy + rules go back to the old mode.
+      Test with injected install failure and an injected save failure (guard.json
+      replaced by a folder). While fixing this a real race was found: the 30 s
+      background check could run between "apply" and "save" and "repair" the rules
+      back to the old mode (the new tests caught it in 3 of 6 parallel runs). The background
+      check now runs only between commands (op lock) - 14/14 clean runs after.
+N-15 P2 DoH fallback TCP-only             AGREED. Any failure (TCP, TLS handshake,
+      certificate, HTTP status, invalid answer) moves to the next bootstrap address,
+      8 s deadline per lookup in total; handshake done explicitly so certificate
+      errors are recognised (rustls::Error::InvalidCertificate...) and logged on
+      their own (rate-limited); same SNI and full verification for every address,
+      no downgrade; last good address first next time. Test: TLS stall, HTTP 503,
+      wrong certificate first / good second, each bounded; all-bad error names the
+      cert failure; deadline caps 6 dead addresses. doh.rs
+N-16 P2/P3 measure before optimising      AGREED, and this one IS measured: Phase 5
+      on the user's PC showed PIA Lite at 42.9 MB private memory of which the four
+      `piactl monitor` helpers were ~38 MB. The tray's region/vpnip monitors are
+      replaced by one-off reads on state change, after commands and every 60 s
+      (2 resident helpers instead of 4, expected ~-19 MB; Phase 5 will show it).
+      Nothing else was "optimised".
+N-17 P3 consolidation boundaries          AGREED as guidance. Policy stays a pure
+      state machine with injected time; the firewall stub has failure/tamper
+      injection; PIA is injected through PIALITE_PIACTL + PIALITE_PIA_SETTINGS (a
+      fake piactl script drives the hotel tests). No catch-all util module added.
+
+Found and fixed while doing this (not in the review):
+  - the slow-check vs. mode-change race described under N-14
+  - Guard::shutdown now joins the background thread (no work after shutdown)
+
+Checks run here: cargo test --workspace (56 tests: 4 common, 41 guard, 11 tray),
+cargo clippy --workspace --all-targets -- -D warnings, cargo fmt --check, clippy -D
+warnings for x86_64-pc-windows-msvc (all crates), PowerShell static checks, ASCII +
+CRLF for all .ps1/.bat/.txt. Mutation checks for N-02 and N-03 (tests fail when the
+fix is removed).
+
+Needs the user's Windows run (not claimed until then):
+  - WFP: filters read back as planned (status "block rules in place ... checked",
+    boot_rules true), Phase 5 "one condition per field" PASS, PIA connects from an
+    armed block (WireGuard; OpenVPN if used)
+  - pipe-selftest: second instance refused, unlock refused, 5th client served
+  - tray: UAC prompt for block down/off and hotel login; cancel leaves it unchanged
+  - test-dns: os_resolver "proxy"; profile "unknown" unless --canary is used
+  - installer: a forced failure (e.g. close the window in stage 4) is undone on the
+    next run
+  - memory: 2 piactl helpers instead of 4
+
+
+=====================================================================================
+ROUND 3 - response to the third review (V3-01 .. V3-12, 2026-11-08)   -> v0.4.0
+=====================================================================================
+
+Same verdict words. Every fix below has a test that reproduces the problem; for
+V3-01, V3-02, V3-03, V3-06 and V3-10 a mutation check was run (the fix removed
+again -> its test fails). As before, Windows runtime evidence is still pending.
+
+V3-01 P1 uninstall with the exe missing   AGREED. firewall::installed() now returns
+      Result<bool>: "couldn't look" (engine not reachable, access denied, any
+      lookup error other than FWP_E_FILTER_NOT_FOUND) is an error, never "none";
+      it also lists boot-time filters and our provider's filters. check-rules
+      exits 0 only after a real look. Startup/reload treat "couldn't look" as
+      "rules present" (fail closed). Uninstall stage 2 needs a guard program: the
+      installed one, else the freshly built one (Install-PiaLite now passes it
+      with -Source), else it STOPS with instructions. Install-PiaLite runs the
+      guard uninstall when any trace exists (exe, service or guard.json), not
+      only when the exe exists. Test: check_rules_never_reads_cant_look_as_none
+      (stub with injected engine failure), firewall value_tampering_and_
+      uninspectable_state. firewall.rs, main.rs, Install-Guard.ps1,
+      Install-PiaLite.ps1
+V3-02 P1 late timer ends a new login      AGREED. Every hotel login has a number
+      (generation). The timer's worker carries the number of the login it ends
+      and does nothing if a newer login exists. Separately, and worse than the
+      review describes: a new login started before the old one's restore would
+      have saved PIA's RELAXED kill switch as "the original" - so the user's
+      "on" could be lost for good. hotel_start now finishes any outstanding
+      restore first and refuses if it can't. Test: late_timer_never_ends_a_
+      newer_hotel_login (old worker run after a new login: login #2 untouched,
+      no reconnect, note says "on", #2's end restores "on").
+V3-03 P1 strict set too late / observe    AGREED, in both parts. (1) "strict"
+      (pending) is now set BEFORE PIA's kill switch is relaxed and kept until
+      the read-back + note clearing succeed. (2) New policy state "restoring"
+      from the end of a login until the restore was tried: nothing opens, not
+      even for a Connected report, and no hand-off counts from that time; after
+      it, a fresh probe is forced. policy.rs (restoring, stop_hotel/restore_done),
+      guard.rs. Tests: policy hotel_exit_rearms_startup_mode (Connected during
+      restore), guard nothing_opens_during_restore_and_off_mode_blocks_until_
+      restored.
+V3-04 P1 upgrade rollback / stage 6       AGREED. Before stage 3 changes anything
+      on an upgrade, the current program and guard.json are copied
+      (pialite-guard.previous.exe, guard.json.previous) and the journal records
+      "guard=upgrade,<was running>,<DNS pointed at it>"; a fresh install records
+      "guard=new". Rollback stops the new guard and puts the previous program +
+      settings back and starts it (if it doesn't answer DNS and PIA pointed at
+      it, PIA's DNS goes to a working fallback), or removes the new service/exe.
+      Journal written whole to a temp file and renamed over the old one. Stage 6
+      is now explicitly best-effort: problems are reported as notes, nothing is
+      undone, and NextDNS app removal is asked separately as permanent. Also
+      fixed: an upgrade's rollback no longer turns ON a NextDNS app that an
+      earlier install had paused (only changes made by this run are undone).
+      NOT done: native fault injection at every stage - the logic is one code
+      path per undo kind; Windows run pending.
+V3-05 P2 WFP drift detection              AGREED. FilterSpec now carries the rule's
+      condition; the check rebuilds the exact WFP conditions (incl. the app ID
+      from FwpmGetAppIdFromFileName0) and compares field key, match type and
+      VALUE (UINT8/16/32, v4 addr+mask, v6 addr+prefix, byte-blob contents),
+      order-independent. Weight: a UINT8 must equal the plan; any other type must
+      have an effective weight whose top 4 bits are that index - an unexpected
+      type is a difference, no silent pass. Provider checked (ours / none for
+      boot), boot sublayer checked (universal). Every other key in our ranges
+      must be empty (not just the next one); boot-time extras are found when
+      listed too. New `pialite-guard show-rules`: every PIA Lite filter as
+      Windows holds it with field, operator and value, then CHECK-OK/CHECK-DIFF;
+      Phase 5 includes it. Stub test: tamper_value (same key, same count,
+      different value) is detected.
+V3-06 P2 command / client deadlines       AGREED. Commands wait at most 15 s for
+      the one before them, then answer "busy" (status never waits). The mode
+      already in force is checked, not reinstalled. Pipe client: overlapped
+      I/O with a deadline (60 s per command, 8 s for the tray's status polls),
+      shared with the server in pialite_common::winio. Emergency path: `unlock`
+      (Unlock-Internet.bat) on a running-but-stuck service stops it (sc stop,
+      30 s), removes the rules directly, sets mode off, starts it again.
+      Documented: a command that timed out on the client may still complete in
+      the service; the status shows the outcome. Tests: commands_wait_a_bounded_
+      time_and_same_mode_is_not_reinstalled, a_silent_service_cannot_hang_the_
+      client.
+V3-07 P2 DoH deadline not global          AGREED. New socket wrapper: every single
+      read and write (TCP, TLS handshake, request, headers, body) gets
+      min(time left, 5 s) and fails once the deadline is reached; the pooled
+      connection gets min(2 s, deadline); each address gets a fair share of the
+      time left. Test: a server dripping one byte per 100 ms is cut off at the
+      1.5 s deadline (without the wrapper the lookup ran ~13 s and succeeded -
+      checked), and [drip, good] still succeeds within the deadline. Also fixed
+      a test flaw from v0.3.0: the "HTTP 503" fallback case used a server with a
+      different certificate, so it tested a certificate failure, not HTTP 503.
+      All fake servers now share one certificate unless a test asks for its own;
+      the 503 case asserts the error mentions 503.
+V3-08 P2 uninstall deletes the marker     AGREED. Service stopped: guard.json, else
+      guard.json.bak; if neither can be read (or both are missing), the
+      uninstall shows PIA's current kill switch and stops unless you type YES
+      after checking it - before anything is deleted. The running-service path
+      uses the same check (it used to stop outright). An unfinished hotel note
+      with "on" is restored and read back as before.
+V3-09 P2 ok=true with unknowns            AGREED. test-dns adds transport_ok,
+      resolver_verified, profile_verified. The installer now REQUIRES
+      resolver_verified (rollback otherwise) with a documented override
+      -AllowUnverifiedResolver; an unknown profile stays a yellow "NOT
+      confirmed" (canary for proof). Header wording no longer implies the
+      profile is verified. "No leaks" still needs the physical capture.
+V3-10 P2 Off mode + failed restore        AGREED - option 2 of the review: while
+      PIA's kill switch isn't verified back, the guard enforces a recovery-only
+      "always" block in every mode, including off (rules are installed at hotel
+      start when PIA's kill switch was "on", removed again after the restore).
+      If the guard can't set that block, hotel start is refused and rolled back.
+      Test: strict_off_mode_blocks_like_always, guard nothing_opens_... test.
+V3-11 P3 pipe DACL updates                AGREED. The access list is built once at
+      service start; set-users replies "takes effect when the guard service
+      restarts". (The installer already sets users while the service is
+      stopped.)
+V3-12 P3 shutdown overclaims              AGREED. Comment narrowed to what is
+      joined (the ticker) and what isn't (probe thread ends at its next check;
+      piactl helpers are killed; a running piactl call may finish). Reconnect,
+      kick and end-of-hotel workers check the stop flag before calling PIA.
+
+Checks run here: cargo test --workspace (63 tests: 5 common, 47 guard, 11 tray;
+6 consecutive clean runs), cargo clippy --workspace --all-targets -- -D
+warnings, cargo fmt --check, clippy -D warnings for x86_64-pc-windows-msvc (all
+crates), PowerShell static checks, ASCII + CRLF.
+
+Still needs the user's Windows run (not claimed): show-rules CHECK-OK with real
+app IDs/subnets; boot-time read-back; pipe-selftest; UAC prompts; installer
+rollback of a forced failure during an upgrade; uninstall with the exe renamed;
+hotel in block mode off (rules appear during the login, disappear after);
+memory with 2 piactl helpers; physical-NIC capture with a positive control.
+
+=====================================================================================
+ROUND 4 - response to the fourth review (V4-01 .. V4-14, 2026-11-08)   -> v0.5.0
+=====================================================================================
+
+V4-01 P1 expiry stops a newer login       AGREED. New Policy::expire_hotel_if_due:
+      "is it due?" and "end it" are one step under one policy lock, and the
+      generation it returns is the one that was due. tick() no longer emits a
+      HotelExpired event that a later stop_hotel acts on. Tests:
+      a_due_timer_never_ends_a_login_started_since (policy) and
+      a_due_timer_does_not_end_a_login_started_since (guard: login #2 starts
+      after #1 is due; #2 keeps its deadline, marker and access).
+V4-02 P1 stale apply_open decision        AGREED - lock order policy -> open. The
+      decision (want_open) and the change of the allow-all now happen while
+      the policy is still locked, so a newer "block" (hotel end, disconnect,
+      strict, adapter down) waits for the change to finish and then undoes it,
+      or runs first and is seen. The allow-all has its own lock (it used to
+      share the firewall lock), so taking it away never waits for a rule
+      install or check. Off mode clears "armed" before dropping the allow-all.
+      Lock graph checked by hand: policy -> open -> fw_view, fw -> open,
+      fw -> fw_view; nothing takes them in the other order. Test (barrier, as
+      the review asked): a_stale_open_decision_cannot_reopen_after_a_block -
+      thread 1 pauses right after deciding "open", thread 2 ends the hotel
+      login, thread 1 resumes: no allow-all, blocking, immediately.
+      Mutation check: moving the decision back outside the lock makes the
+      test fail.
+V4-03 P1 stale .bak hides hotel note      AGREED. A separate recovery record
+      (ProgramData\PiaLite\hotel-recovery.json, written durably BEFORE PIA's
+      kill switch is changed, never rotated into a .bak, removed only after
+      the kill switch is read back) holds what must be put back. Service start
+      and uninstall look at it first; a damaged record counts as "kill switch
+      was on" (restore). guard.json's marker stays as a second copy. Test:
+      recovery_record_survives_a_stale_settings_backup (primary deleted, the
+      valid but older .bak says no hotel login, restart: the guard still
+      restores "on"). Mutation check: ignoring the record makes it fail.
+V4-04 P1/P2 missing EXE breaks uninstall  AGREED. Uninstall now picks the tool
+      ($tool) before stage 1 and uses it for every step (hotel stop included);
+      with no tool it stops before changing anything and says how to get one.
+      The installer keeps a recovery copy of the guard at
+      ProgramData\PiaLite\recovery\pialite-guard.exe (admin-only folder).
+      Unlock-Internet.bat tries the installed exe, then the recovery copy; if
+      neither exists it says block rules MAY still be in Windows and to run
+      Build-PiaLite.bat, then try again - never "nothing to unlock".
+V4-05 P2 show-rules exit 0 on DIFF        AGREED. show-rules exits 1 when any
+      check differs, and also when rules are expected (mode not off, or the
+      guard says armed) but none are found, or rules are found when none are
+      expected. Human-readable output is printed either way. New
+      show-rules --json: {rules, expected, basis, checks, ok}. Test:
+      show_rules_fails_on_a_difference.
+V4-06 P2 restore ignores WFP sync result  AGREED. try_restore returns an error
+      when PIA's kill switch is back but the guard's rules could not be
+      brought in line; hotel stop / finish then reports that (and keeps
+      retrying every 30 s) instead of full success. Test:
+      restore_reports_a_firewall_sync_failure. Mutation check: dropping the
+      sync result makes it fail.
+V4-07 P2 provider/sublayer objects        AGREED. verify() now reads back the
+      provider object (PERSISTENT set, DISABLED clear) and the sublayer object
+      (weight 0x7000, PERSISTENT, owned by our provider). Each filter's flags
+      are checked against a mask of risky flags (DISABLED,
+      CLEAR_ACTION_RIGHT, PERMIT_IF_CALLOUT_UNREGISTERED); other flags Windows
+      fills in are allowed. A changed provider/sublayer is deleted and added
+      again inside the install transaction. Known limit, documented in the
+      code: while the temporary allow-all exists (it lives in that sublayer)
+      the replace fails; the old rules stay (the transaction rolls back), the
+      error shows in status, and the next check repairs it once the allow-all
+      is gone. Windows-only code: compile- and clippy-checked for
+      x86_64-pc-windows-msvc, NOT run here - needs a native tamper test.
+V4-08 P2 boot handoff not proven          AGREED on wording. DESIGN.txt and the
+      firewall.rs header now call the boot -> persistent handoff a design
+      expectation that needs a Windows test (cold boot, Fast Startup,
+      Wi-Fi auto-connect, physical-NIC capture with a positive control), not
+      something Microsoft's documentation proves for this layout.
+V4-09 P2 rollback edge cases              AGREED. Upgrade journal entry is now
+      guard=upgrade,<running>,<startmode>,<cfg>,<bak>,<sha256 of old exe>:
+      guard.json and guard.json.bak are each saved as an exact copy or
+      recorded as absent; rollback restores the exact bytes or deletes the
+      new file, and checks the restored exe's hash. The saved copies are kept
+      until rollback finishes. guard=new also removes the recovery copy.
+V4-10 P2 unbounded native waits           AGREED. Invoke-Native has a timeout
+      (default 90 s; test-dns 150 s, unlock 120 s, check-rules 60 s) using
+      asynchronous output readers and WaitForExit(ms); on timeout it kills
+      that one program (never the PIA service) and fails the step, which
+      runs the normal rollback. Invoke-Piactl: 30 s. sc.exe stop/start are
+      polled with a limit. NextDNS uninstaller waits: 300 s. Phase5-Tests uses
+      the same helpers (180 s). Static checks only - a fake hung piactl run
+      on Windows is still to do.
+V4-11 P2/P3 https_get clock               AGREED. The 15 s deadline is set before
+      the TCP connect, and the connect uses the time left.
+V4-12 P2 Connected is an approximation    AGREED, partly fixed. New adapter watch
+      (netif.rs, GetAdaptersAddresses, once a second): when PIA says
+      Connected, the guard learns which PIA adapter (wgpia0 / "Private
+      Internet Access" description) is up; if that adapter goes down or
+      disappears while PIA still says Connected, the guard treats it as
+      disconnected and blocks at once. Status shows "vpn_adapter". Tests:
+      a_dead_tunnel_adapter_is_not_connected,
+      vpn_adapter_going_down_blocks_even_if_pia_says_connected,
+      only_pia_adapters_count. Mutation check: ignoring tunnel_down makes them
+      fail. Still not proof: a tunnel that is "up" but broken is not caught;
+      worst case is still about one second plus PIA's own reaction. The
+      guard-only packet-capture test the review describes is still needed
+      and no "zero leaks" claim is made.
+V4-13 P3 show-rules scope wording         AGREED. DESIGN.txt and the firewall.rs
+      header say the read-back covers our provider's filters on
+      ALE_AUTH_CONNECT v4/v6 (the only layers the guard uses) plus boot-time
+      filters with our keys, not every WFP layer.
+V4-14 P3 status waits for WFP             AGREED. status() reads a small snapshot
+      (fw_view), an atomic "armed" flag and the allow-all lock; it never waits
+      for a rule install or check. What remains: status takes the policy
+      lock, which apply_open holds while adding/removing the allow-all (one
+      small dynamic WFP transaction) - by design, for V4-02.
+
+Checks run here: cargo test --workspace (73 tests: 5 common, 57 guard, 11 tray;
+6 consecutive clean runs), cargo clippy --workspace --all-targets -- -D
+warnings, cargo fmt --check, clippy -D warnings for x86_64-pc-windows-msvc (all
+crates), PowerShell static checks, ASCII + CRLF.
+
+Still needs the user's Windows run (not claimed): everything from round 3,
+plus: the "VPN adapter 'wgpia0' is up - watching it" log line and the block
+when the adapter is disabled while PIA says Connected; show-rules exit code
+(0 when OK, 1 on a difference) and --json; provider/sublayer read-back with
+real WFP; Unlock-Internet.bat with the installed exe renamed (should use the
+recovery copy); upgrade rollback restoring guard.json/.bak exactly; installer
+timeouts with a hung piactl.
+
+-------------------------------------------------------------------------------------
+Windows run of v0.5.0 (user's PC: Windows 11 Home build 26300, PIA 3.6.1, Wi-Fi,
+Fast Startup off, 2026-11-08) and the follow-up fixes            -> v0.5.1
+-------------------------------------------------------------------------------------
+Quick checks: 28 PASS, 0 FAIL, 1 WARN, 2 INFO.
+  - show-rules (admin): CHECK-OK for the 29 persistent and 6 boot-time filters,
+    with the real PIA program paths and LAN ranges (exit code not recorded).
+  - Pipe self-test as a normal user: second pipe instance refused, 'unlock'
+    refused, with 4 stuck clients another client got an answer after 3.0 s.
+  - Block test with PIA's kill switch OFF: the guard alone blocked (47 attempts
+    blocked, PIA's own 22 allowed); PIA connected while blocked in 7 s; PIA's
+    kill switch put back to On and read back.
+  - Hotel test: internet without the VPN during the login, blocked again at the
+    end until PIA reconnected, PIA's kill switch back to On (read back).
+  - DoH leaves through wgpia0; Windows' resolver uses the guard; plain DNS to
+    1.1.1.1 blocked. WARN = NextDNS profile not confirmed (canary not run).
+  - Memory: guard 2.2 MB private, tray 2.4 MB, two piactl helpers ~9 MB each.
+  - Adapter watch (V4-12): "VPN adapter 'wgpia0' is up - watching it" 0.5 s
+    after PIA said Connected. The adapter-down test (disable wgpia0 while PIA
+    still says Connected) has NOT been run yet.
+Startup leak test (restart, block mode startup, PIA Allow LAN on): 1 PASS, 1 WARN.
+  - Guard started +9.8 s after boot; rules in place and read back at +9.9 s.
+  - Firewall audit (from +10 s): no program other than PIA reached the internet
+    before the VPN connected (+75.5 s); 40 attempts blocked; DHCP and LAN
+    allowed (Allow LAN on).
+  - Wi-Fi only connected at +71.9 s (probably at sign-in), so on this run there
+    was no internet connection during the first ~70 s of boot: this run says
+    nothing about the boot-time window. A run where the network is up before
+    the guard starts (Ethernet, or Wi-Fi that connects at the sign-in screen)
+    is still needed for V4-08.
+  - Packet capture: INCONCLUSIVE - 107 frames read, none counted as "sent by
+    this PC". Cause found: a test-kit bug, see below.
+  - "control pipe: all 4 slots busy" at +80 s: the pipe self-test that
+    Run-Phase5.bat runs before it asks for admin (it holds 4 slots on purpose).
+    Expected; the report now says so.
+
+v0.5.1 changes (test kit + one cosmetic guard change):
+  - Phase5 packet capture: the netsh/ndiscap capture marks every frame sent or
+    received (keywords 0x100000000 / 0x200000000) and records Wi-Fi as raw
+    802.11 frames (keyword 0x10000) - as Microsoft's etl2pcapng reads them.
+    The kit read every frame as Ethernet and picked "this PC's" frames by the
+    MAC address at bytes 6-11, which in an 802.11 frame is the access point's
+    address field - so a Wi-Fi capture could never show anything. Now: the
+    sent mark decides direction; 802.11 data frames to the access point are
+    parsed (QoS, HT control, 4-address, CCMP header, LLC/SNAP); follow-on
+    pieces of split packets and PIA's own tunnel adapter are skipped; the MAC
+    check is kept only for captures without the sent/received mark. The report
+    prints what the capture contained (frame types, sent/received counts - no
+    MAC addresses). Checked here with a copy of the parsing logic on 14
+    made-up frames; the PowerShell itself only passed static checks - the
+    next leak test on Windows is the real test.
+  - Quick checks: new check "Guard watches the VPN adapter" (status field
+    vpn_adapter) while PIA is connected.
+  - Leak report: "PIA started connecting" shown as "+17.4s" (was "+  17.4").
+  - show-rules lists rules by number (#2 before #10; was text order). Test:
+    rule_lines_sort_by_number.
+
+Checks run here: cargo test --workspace (74 tests: 5 common, 58 guard, 11 tray),
+cargo clippy --workspace --all-targets -- -D warnings, cargo fmt --check, clippy
+-D warnings for x86_64-pc-windows-msvc (all crates), PowerShell static checks,
+ASCII + CRLF.
+
+=====================================================================================
+ROUND 5 - response to the fifth review (F51-01 .. F51-09, 2026-11-08)  -> v0.6.0
+=====================================================================================
+
+F51-01 P1 uninstaller recovery reader     AGREED. One strict format, version 1:
+      {"version":1,"hotel":<1..2^53-1>,"saved_killswitch":"on|auto|off"}, no
+      other fields, case-sensitive names ("version" may be missing: v0.5).
+      One decision rule for both readers: the record decides; guard.json's
+      note counts only without a record; a record that disagrees with the
+      note, a damaged record, or a note with an unknown value is UNKNOWN -
+      the uninstaller then requires the manual check (type YES), the guard
+      restores "on". Rust: config.rs parse_recovery / decide. PowerShell:
+      scripts\PiaLite-Common.ps1 Get-RecoveryVerdict (used by the uninstaller).
+      Contract: scripts\recovery-fixtures.json, 41 cases (the review's list:
+      on/auto/off, invalid, "", null, missing field, corrupt JSON, missing
+      record + hotel_active, disagreeing files; plus wrong types, fractions,
+      out-of-range, extra field, case-variant name, arrays). Rust test
+      recovery_fixtures_agree runs them in cargo test; the Phase 5 quick
+      checks run the PowerShell reader on the same file on Windows. Mutation
+      check: dropping the "disagree" rule fails the Rust test. Not covered:
+      duplicate JSON keys (Rust keeps the last, PowerShell 5.1's behaviour
+      not verified) - no fixture claims either way.
+F51-02 P1 ACLs not normalized             AGREED. Install stage 3, before the
+      service uses the files: the data folder gets owner Administrators and a
+      complete, protected list - SYSTEM F, Administrators F, Users RX, OWNER
+      RIGHTS RX (so a file that ends up owned by the installing account can't
+      have its permissions changed by that account unelevated) - every other
+      allow entry and every deny entry is removed. Settings/records owned by
+      an account other than SYSTEM, Administrators or the installing admin are
+      refused (install stops, names the files). Then everything inside is
+      re-owned to Administrators FIRST and reset to inherit only that (order
+      matters: an inherited CREATOR OWNER entry is filled in from the owner).
+      C:\Program Files\PiaLite: same, reset to Program Files' permissions.
+      Then every file and folder is checked (owner, and no allow entry with
+      write/append/delete/permission/ownership/generic-write rights for anyone
+      but SYSTEM/Administrators/TrustedInstaller, CREATOR OWNER inherit-only
+      excepted); any problem stops the install. Users keep read access on
+      purpose (documented: the tray installer reads the saved NextDNS ID;
+      guard.log readable without admin). Residual: the installing admin's own
+      account is trusted as an owner because Windows may record it (instead
+      of Administrators) for files an elevated tool creates - a program
+      running as that same account could have planted files before v0.6.0;
+      from v0.6.0 on it can't change them. Static checks only; needs the
+      review's pre-created-folder test on Windows.
+F51-03 P2 show-rules expectations         AGREED. The guard now states what it
+      WANTS (status: rules_wanted, boot_rules_wanted, effective_mode - the
+      same rule enforce() uses: effective mode not off; boot-time also needs
+      the setting). show-rules compares wanted vs present both ways for both
+      kinds (wanted+missing, present+unwanted, present+changed = CHECK-DIFF,
+      exit 1); without a running guard it applies the same rule to the saved
+      settings + recovery record; an older guard that doesn't say -> saved
+      settings. Tests: show_rules_truth_table (off/startup/always x boot
+      setting x strict x present/missing/changed for both kinds = 108 cases,
+      plus "Always with boot rules off" and "Off with orphan boot rules" from
+      the running-guard side), show_rules_fails_on_a_difference (now also
+      orphan boot rules -> exit 1). Mutation check: ignoring present+unwanted
+      boot rules fails both tests.
+F51-04 P2 journal vs backups              AGREED. Commit = the undo list is
+      overwritten with "done" (temp file, flushed to disk, renamed - must
+      succeed, else the install counts as failed and is undone with its copies
+      intact); only then are the saved copies deleted (failures reported, not
+      silent); a leftover "done" list makes the next run only tidy up. Same
+      after a successful rollback. Not yet fault-injected on Windows.
+F51-05 P2 broken installed EXE            AGREED. Each candidate (installed,
+      recovery copy, fresh build) must exist, match the SHA-256 recorded when
+      the install finished (guard.sha256, admin-only; restored to the previous
+      program's on rollback; not for the fresh build) and answer the new
+      "version" command within 20 s; broken ones are skipped with the reason;
+      the first good one is pinned for every step; none -> stop before any
+      change. Unlock-Internet.bat also falls back to the recovery copy when
+      the installed one fails, not only when it is missing.
+F51-06 P2 time limits not absolute        AGREED. One deadline for the
+      program's exit AND both output reads (bounded Task.WaitAll); a program
+      that ends while a child holds its output is a timeout (reads abandoned,
+      nothing waits on them); timeout -> taskkill /T then Kill; a program that
+      can't start returns an error instead of throwing past -AllowFail;
+      Process disposed. One shared copy (PiaLite-Common.ps1) for the installer
+      and the tests. Regression in the Phase 5 quick checks (on Windows):
+      cmd /c start /b ping - the child keeps the pipe open - must return
+      within ~4 s with a 4 s limit.
+F51-07 P2 tunnel watch narrower           AGREED. Status field tunnel_watch:
+      checking / up / down / not-found / query-failed (and "" = not
+      connected), in the status and, when it matters, in the tray. Always
+      mode now needs a VERIFIED tunnel: PIA Connected AND the adapter seen up;
+      looked at the moment PIA reports Connected and every 200 ms until found
+      (no added delay when the adapter is already up); not-found after 3 s
+      keeps blocking (fail closed); query-failed keeps the last verdict.
+      Startup mode unchanged in meaning (documented): PIA takes over at
+      Connected; only an adapter already known down/missing stops the
+      hand-off. Tests: always_mode_needs_the_tunnel_seen_up (policy),
+      vpn_adapter_going_down_blocks_even_if_pia_says_connected (guard:
+      up/down/query-failed/not-found). Mutation checks: "not down" instead of
+      "up" fails the policy test; removing the check at Connected fails the
+      guard test. Phase 5 block test has an optional real adapter-down test
+      (Disable-NetAdapter, checks blocking and which signal caught it).
+      Not covered here: OpenVPN/TAP and adapter renames on a real system.
+F51-08 P1 gate: early boot unproven       AGREED - not claimed. New evidence
+      tools, results still to come from Windows: (1) at every start the
+      guard logs what Windows held BEFORE it changed anything (provider and
+      sublayer state, stored rules vs the plan, run-time ids); (2) the leak
+      test reports it, says whether the network was up before the guard
+      started (only then is that window tested; the v0.5.0 run: no - Wi-Fi at
+      +71.9 s) and counts which blocks a PIA Lite rule decided (audit
+      FilterRTID vs the logged/current ids); (3) optional "hold the guard
+      back" (delayed start, ~2 min) - any block before it starts is the
+      stored rules alone, or PIA's kill switch, which (2) tells apart.
+      serviceName on the provider: deliberately unchanged until tested.
+F51-09 P2 Wi-Fi parser needs a live control  AGREED. Phase 5 option 5: a short
+      capture while known UDP packets go to the gateway (IPv4) and ff02::1
+      (IPv6); the same analysis the leak test uses must find them (PASS) or
+      the report says the leak-test capture would be inconclusive (FAIL); one
+      anonymized frame of each (MACs and this PC's address zeroed) is printed
+      as a test case for the next round.
+
+Also in v0.6.0 (the user's requests):
+  - Faster start: the tray starts from a sign-in scheduled task (the Run key
+    waits for the desktop to settle; the Run key stays as the fallback).
+    The guard asks PIA to connect once a network is up (or after 30 s), and
+    restarts PIA's attempt when the network appears while PIA, which had
+    been retrying since before, waits up to 10 s between retries (PIA's own
+    source: vpnstate.h 1 s x2 then 10 s; a connect while connecting is
+    ignored, vpn.cpp). Once per network-up, >= 15 s apart, only while the
+    guard blocks for want of the VPN. Tests:
+    asks_pia_to_connect_once_a_network_is_up,
+    restarts_pia_when_the_network_comes_up_mid_retry,
+    waits_for_a_network_before_asking_pia_to_connect; mutation-checked.
+    A NextDNS connection is opened the moment the VPN connects.
+  - Tray labels say what the modes mean: "At startup until VPN connects (then
+    PIA's kill switch)", "Always when VPN is not connected (includes startup)".
+  - show-rules lines carry each rule's run-time id ("[id N]").
+
+Checks run here: cargo test --workspace (81 tests: 5 common, 65 guard,
+11 tray; 6 clean runs), cargo clippy --workspace --all-targets -D warnings,
+cargo fmt --check, clippy -D warnings for x86_64-pc-windows-msvc (all
+crates), PowerShell static checks, ASCII + CRLF. PowerShell was NOT run
+here (not allowed in this environment): every PowerShell change in this
+round is checked only statically until the Phase 5 run on Windows.
+
+=====================================================================================
+ROUND 6 - the v0.6.0 lock-out + the sixth review (V60-01 .. V60-11)  -> v0.6.1
+=====================================================================================
+
+LOCK-OUT (found by the user on Windows, not by a review): after installing
+      v0.6.0 the internet stayed blocked with the VPN connected. guard.log:
+      the rule refresh at start failed at commit with FWP_E_IN_USE
+      (0x8032000A); the guard then set "armed = false" while the OLD rules
+      stayed in Windows, and "allow all" is only added when armed - so
+      nothing opened, and DoH failed with 10013 (blocked by the firewall).
+      Rolling back to v0.5.1 had the same flaw. Fixed in guard.rs (enforce):
+      when a refresh fails, the guard asks Windows what it still holds - the
+      planned rules (then they are kept as the expected set) or older PIA
+      Lite rules count as in place, so "armed" stays true and "allow all" is
+      still added while the VPN is connected; only "no PIA Lite rules at
+      all" is not armed; a failed look counts as in place (fail safe for the
+      block, and the opening still works). Test
+      a_failed_rule_refresh_never_strands_the_vpn (3 cases: rules matching,
+      older rules present, no rules). Mutation check: storing "false" again
+      fails it. Also: the provider/sublayer objects are deleted and re-added
+      only when they really differ (they were before every refresh);
+      "block lifted (VPN connected / hotel login)" is logged only when "allow
+      all" was really added; on failure the log gets "firewall details"
+      (provider, sublayer, our filters persistent/temporary/foreign, other
+      "PIA Lite guard" firewall sessions with process ids), at most every 10
+      minutes while it repeats; the tray shows "Firewall problem"; the
+      installer prints the guard's problem lines since its last start and,
+      if a rollback is incomplete, how to unlock the internet.
+      NOT KNOWN: why Windows said "in use". The usual cause is another
+      session holding an object; the details line is there to find out.
+
+V60-01 P1 queued kick vs a new connection  AGREED. The restart is now a
+      worker tied to one connecting attempt: policy.rs numbers each new
+      connecting episode (attempt_gen); guard.rs restart_attempt runs one
+      at a time (kick_running), and run_restart re-checks before
+      "disconnect" that PIA is still stuck in THAT attempt and the block is
+      still the guard's business (kick_still_valid); after "disconnect" it
+      waits for an observed Disconnected newer than the disconnect
+      (may_reconnect) and connects only then; Connected / Connecting /
+      Reconnecting seen after it, or the block no longer being the guard's
+      business, ends it with no connect; a timeout ends it with no blind
+      connect. piactl calls go through a small trait so the test records
+      them. Test a_queued_restart_only_acts_on_the_same_stuck_attempt (9
+      cases with a call recorder: PIA connects before the worker runs; the
+      user disconnects first; a newer attempt; block turned off; a hotel
+      login - nothing sent in all five; the normal case -> disconnect, PIA
+      reports Disconnected, connect; PIA stays "Disconnecting" -> no blind
+      connect; PIA connects again during the wait -> no second connect; a
+      second worker while one runs is dropped). Mutation checks: removing
+      kick_still_valid, may_reconnect or the one-at-a-time guard each fails
+      it.
+V60-02 P1 trust before replay              AGREED. New order in install and
+      uninstall: (1) Assert-DataDirTrusted - READ-ONLY: the folder is walked
+      without entering junctions/symbolic links (Get-TreeItems); any link
+      anywhere = refuse; the folder, every folder in it, and every file PIA
+      Lite reads/replays/copies (guard.json(.bak), hotel record, undo list,
+      checksum, recovery copy, .previous copies, DNS/NextDNS/Fast Startup
+      backups) must be owned by SYSTEM / Administrators / TrustedInstaller /
+      the installing admin and give no change rights to anyone else (CREATOR
+      OWNER inherit-only excepted) - else stop, change nothing, say what was
+      found and what to do; (2) Protect-DataDir (install: always - a new
+      folder is created locked, before the undo list or any saved copy is
+      written; uninstall: if it exists); (3) only then the undo list: every
+      line must match the grammar the installer writes (done | nextdns |
+      guard=new | guard=upgrade,<0/1>,<0/1>[,<0/1>,<0/1>,<SHA-256 upper-case
+      hex>] | dns="<a-z>" or dns=[<IP>,...]), at most 10 lines, else nothing
+      is replayed; v0.5.x lines still match; the saved program's SHA-256 is
+      checked before use (as before). Find-WeakPermissions also uses the
+      link-free walk; the program folder is checked for links before icacls
+      /T runs. Python mirror of the grammar: 11 valid / 11 invalid lines as
+      expected. Residual: the tray installer (not elevated) reads the saved
+      NextDNS ID to suggest it - a planted value would be shown, but the
+      elevated step refuses an untrusted folder before using anything.
+      Static checks only: the review's Windows tests (Users:Modify, forged
+      undo list, precreated .previous, junction) are still to be run.
+V60-03 P1 presence is not protection       AGREED. Renamed and demoted: INFO
+      "Stored PIA Lite rules were present and matched the plan when the
+      guard service started" (WARN if they didn't). New verdict "Protection
+      before the guard started": PASS only with ALL of - a network up before
+      the guard started; attempts in that time; at least one blocked by a
+      STORED PIA Lite rule (ids from the start-up log only, not the later
+      ones); nothing reaching the internet (audit); a capture that saw PIA's
+      own packets (positive control), saw this PC's packets before the guard
+      started and read through that time, with nothing else leaving.
+      Anything missing -> WARN INCONCLUSIVE listing what; anything out ->
+      FAIL. "This run covered the time before the guard started" is INFO
+      now. The timeline adds the filtering engine's (BFE) and PIA service's
+      program start times and the first audit event; the boot-time ->
+      stored-rule switch is named as something only the capture can see.
+V60-04 P2 offline show-rules               AGREED. Without settings files it
+      now asks Windows (firewall::installed(), a failed look = "present",
+      fail safe). Test show_rules_offline_without_settings (no files + no
+      rules -> nothing wanted, exit 0; no files + rules -> recovered
+      startup, checked). Mutation check: back to "always present" fails it.
+V60-05 P2 30 s wait measured wrongly       AGREED. The fallback counts from
+      the rearm (boot/wake) or from when the network went away, whichever
+      is later - not from the age of PIA's state. Test
+      asks_pia_to_connect_once_a_network_is_up gains the wake case (PIA
+      Disconnected long before, network down: nothing at +29 s, asked at
+      +30 s after the wake). Mutation check: back to state age fails it.
+V60-06 P2 capture coverage                 AGREED. Get-CapturedPackets
+      reports Truncated (read limit reached before the cut-off), first/last
+      event, the longest stretch without events, packets per adapter; the
+      leak test shows a coverage line, and "nothing but PIA" is PASS only if
+      coverage is complete (not truncated, events until <= 3 s before the
+      VPN connected, first event within 5 s of the network start) -
+      otherwise INCONCLUSIVE; netsh's stop errors are shown. Regression in
+      option 5: the same capture read with a limit of 5 events must report
+      itself incomplete. Not done: paging past 400,000 events.
+V60-07 P2 output reads                     AGREED. Invoke-Native reads both
+      outputs in 64 KB pieces (BaseStream.ReadAsync + Task.WaitAny under one
+      deadline), keeps up to -MaxOutputBytes (4 MB default) per stream,
+      drains and drops the rest and says so (Truncated, and a note in the
+      error text); a read that fails is an explicit failure ("ran, but its
+      output could not be read") even with exit 0; a program that can't
+      start returns Code -1 with -AllowFail. Phase 5 quick checks: output
+      cap (cmd echoing ~210 KB with a 64 KB cap), start failure. Not
+      covered: injecting a read fault on Windows.
+V60-08 P2 adapter up is not the tunnel     AGREED (wording + information).
+      Status, tray, docs and Phase 5 say "PIA adapter observed up" and that
+      it is what Windows reports. New: the guard records the adapter's
+      interface index and compares it with Windows' best route to NextDNS's
+      address (GetBestInterface) - route_via_vpn in the status, a WARN in
+      Phase 5 when it differs; information only, never used to open. Test:
+      vpn_adapter_going_down_blocks_even_if_pia_says_connected also checks
+      route_via_vpn yes/no and that "no" doesn't block. Not done: LUID/GUID
+      identity, PIA's protocol, OpenVPN/TAP on a real system.
+V60-09 P3 warm connection epoch            AGREED. A network number (epoch)
+      goes up on every reset; a warm-up keeps its connection only if the
+      number is unchanged and the pool is empty; one warm-up at a time.
+      Test warm_connection_belongs_to_its_network. Mutation check: ignoring
+      the epoch fails it. Not benchmarked.
+V60-10 P3 timeout + cleanup                AGREED. Documented as "the limit,
+      plus up to ~8 s to stop what is still running". Stop-ProcessTree walks
+      the program's descendants (Win32_Process parent ids, only processes
+      created after the call began - and, for a program that already ended,
+      before it ended - so a reused process id isn't hit), stops them, then
+      the program, all inside a 5 s grace with 3 s per query. A child left
+      holding the output after its parent ended is now stopped too. Phase 5
+      regression: cmd /c start /b ping with a 4 s limit must return within
+      12 s with "kept its output open", and the ping must be gone. Not a job
+      object (documented).
+V60-11 release validation                  AGREED. Duplicate names: Rust
+      (json_keys_ok, a raw scan of the record's names) and PowerShell
+      (Test-JsonKeys) both reject a name that appears twice, also differing
+      only in case, or that is written with an escape, and a record over
+      4 KB -> unknown. Fixtures 41 -> 50 (duplicates, case collisions,
+      escaped names, oversize, a quote inside a value, guard.json
+      duplicates); a Python mirror of the PowerShell rules gives the same
+      50 answers. Mutation check: dropping json_keys_ok fails
+      recovery_fixtures_agree.
+
+Checks run here: cargo test --workspace (85 tests: 5 common, 69 guard,
+11 tray; 6 clean runs), cargo clippy --workspace --all-targets -D warnings,
+cargo fmt --check, clippy -D warnings for x86_64-pc-windows-msvc (all
+crates), PowerShell static checks on every script (brackets, statement
+blocks; every command called is defined or a built-in cmdlet; the new
+installer code's variables checked by hand), ASCII + CRLF. PowerShell was NOT run here (not allowed in this
+environment): every PowerShell change in this round - the trust check,
+the undo-list grammar, Invoke-Native, the Phase 5 verdicts - is checked
+only statically and by Python mirrors until the Phase 5 run on Windows.
+
+-------------------------------------------------------------------------------------
+v0.6.2 - found by the user on Windows after v0.6.1 (no review round)
+-------------------------------------------------------------------------------------
+NO TRAY ICON (v0.6.0 and v0.6.1): the tray process ran but showed no icon after
+      sign-in. Cause (from Slint 1.18.1's source, items/system_tray/windows.rs):
+      the icon is added once, and if Shell_NotifyIcon(NIM_ADD) fails - the
+      taskbar doesn't exist yet, which became likely when v0.6.0 started the
+      tray from a sign-in scheduled task within a second - Slint only writes a
+      debug message and never retries; its window is message-only, so it never
+      receives the "TaskbarCreated" broadcast either. A second start did
+      nothing (single instance). Fixed in the tray (app.rs, winutil.rs): wait
+      for Shell_TrayWnd + TrayNotifyWnd before adding the icon (up to 30 s); a
+      hidden top-level window hears "TaskbarCreated" and makes the icon again;
+      every 5 s, if this process has no Slint tray window (Slint destroys it
+      when adding fails), the icon is made again (3 tries, then once a minute,
+      logged every 5 min); a second start posts "show again" to the running
+      copy, which re-adds a missing icon or opens the panel. Each re-add is
+      logged in tray.log. Compile-checked for Windows (clippy -D warnings);
+      not run here - needs a Windows sign-in to confirm.
+Phase 5 "VPN adapter turned back on" FAIL: WireGuard's adapter (wgpia0) is
+      deleted when PIA drops the tunnel and recreated on reconnect, so there
+      was nothing to re-enable. The test now checks first and reports INFO
+      "not needed"; it still fails if the adapter exists and can't be enabled.
+
+=====================================================================================
+ROUND 7 - final release review of v0.6.2 (FINAL-01 .. FINAL-05)  -> v0.6.3
+=====================================================================================
+Targeted fixes only, as the review asked - no refactor.
+
+FINAL-01 P1 "some rule present" counted as protected   AGREED. The guard now
+      keeps two separate answers (guard.rs): `armed` = VERIFIED, and
+      `rules_present` = some PIA Lite rule is (or may be) in Windows. Only
+      `rules_present` decides whether the VPN-connected allow-all may be
+      added (so the v0.6.0 lock-out can't come back); status, "blocking",
+      the hotel restore check and the tray use `armed`. After a failed
+      refresh, verified means one of: the planned set exactly; exactly the
+      set the guard last verified; or the new firewall::block_floor - our
+      provider and sublayer as planned, on BOTH IPv4 and IPv6 an intact
+      persistent unconditional BLOCK (layer, action, flags incl. not
+      disabled, weight, provider, sublayer, no conditions) in our sublayer,
+      and every filter in our sublayer or under our provider either that,
+      our own temporary allow-all, or a rule of the plan (either Allow LAN
+      choice) or of the last verified set (compared by shape with the same
+      check_filter used for verification). Anything else - a lone boot-time
+      rule, IPv4 only, a block turned into a permit, an unknown rule, or
+      Windows not answering - is "protection can NOT be confirmed" (status
+      reason + fw_error), armed = false, allow-all still possible. The
+      drift check now only runs for the current plan, so a plan change
+      doesn't log "drift" every time. Test
+      a_failed_rule_refresh_never_strands_the_vpn: the review's cases (a)
+      previous verified set after a plan change, (b) one boot rule only,
+      (c) IPv4 deny only, (d) deny changed to permit, (e) an unrelated rule,
+      (f) WFP read error, (g) full set after rollback, plus older rules of
+      the other LAN choice (verified by the floor) and nothing at all - each
+      checks armed, "blocking", the status reason, and whether the allow-
+      all is added. Mutation checks (each fails the test): "present ->
+      armed" again; floor not requiring IPv4; floor accepting unknown rules;
+      allow-all gated on `armed` instead of `rules_present`.
+      The underlying 0x8032000A: still unknown - it hasn't happened again
+      since v0.6.1, so no "firewall details" line has been captured yet.
+FINAL-02 P2 reconnect worker races                      AGREED.
+      - a failed "disconnect" ends the restart (Restart::DisconnectFailed);
+      - the last check is right before "connect" (may_reconnect + same
+        attempt number); what can still happen between that check and PIA
+        receiving the command is harmless (PIA ignores connect while
+        connected; block off doesn't make a VPN connection unwanted) -
+        holding the policy lock across piactl (up to 5 s) would stall the
+        guard, so it isn't;
+      - guard-started PIA commands are serialized (pia_cmd lock), and the
+        startup/wake connect is skipped while a restart runs and re-checks
+        "still Disconnected, user didn't press Disconnect" before sending.
+        This also fixes something the user's v0.6.1 leak test showed: the
+        restart and the startup connect both sent "connect" at once, piactl
+        timed out after 5 s and the connection came ~5 s later;
+      - user intent: the tray now tells the guard "user disconnect" /
+        "user connect" (control pipe, any user - it can only make the guard
+        less eager to connect). After a Disconnect: no startup connect, no
+        restarts, a running restart doesn't reconnect - until Connect in the
+        tray, PIA seen Connected, or the next boot/wake. Disconnects made in
+        PIA's own app or with piactl are not seen (limitation).
+      Tests: a_queued_restart_only_acts_on_the_same_stuck_attempt gains (10)
+      failed disconnect followed by an unrelated Disconnected -> no connect,
+      (11) the user presses Disconnect while it waits -> no reconnect, (12)
+      a newer attempt started by someone else before the last check -> no
+      connect; new policy test a_user_disconnect_stops_automatic_connects.
+      Mutation checks: each of these changes (abort on failed
+      disconnect, user_off in may_reconnect / should_auto_connect /
+      kick_still_valid / rearm reset / clear on Connected, attempt number in
+      the last check) fails a test when removed.
+FINAL-03 P2 UDP/1337 counted as PIA                     AGREED. New
+      Split-CapturedInternet: PIA = address + port + protocol that the
+      firewall audit saw a PIA program connect to; a PIA address on another
+      port, or UDP 1337 to an address no PIA program used = "unsure" ->
+      INCONCLUSIVE (listed), never PASS and never counted as the positive
+      control; everything else = other -> FAIL. The pre-service verdict
+      lists unsure packets as missing evidence. Quick-check regression with
+      synthetic packets (PIA endpoint, UDP/1337 elsewhere, PIA address on
+      another port, other): 1 / 2 / 1 expected.
+FINAL-04 P3 icon check sees Slint's window              ACKNOWLEDGED, not
+      changed (the review: keep it if it works; the user confirmed the icon
+      is fixed). Documented as a known limit (DESIGN 10, checklist).
+FINAL-05 P3 taskbar wait before the workers             ACKNOWLEDGED, not
+      changed (no measured problem; instant when the taskbar is there).
+Release gate / freeze: RELEASE-CHECKLIST.txt (install, upgrade, rollback,
+      uninstall, manual unblock, the Windows gate with mandatory/optional
+      items, known limitations). Phase 5 reports now carry a "Build:" line
+      (first 16 hex digits of the SHA-256 of the guard and tray programs).
+      Plain text (.txt, ASCII/CRLF) like the other docs.
+Optimization pass (measured, from the user's v0.6.1 report): PIA Lite's own
+      footprint is ~4.6 MB private (guard 2.2, tray 2.4) plus two piactl
+      helpers (~8.7 MB each, one for the tray, one for the guard) - most of
+      the total, but each is PIA's own tool and needed for status; merging
+      them would tie the tray to the guard. Not changed. The one measured
+      slowdown (the double connect, ~5 s) is fixed above. The tray's 5-s
+      icon check is a handful of window lookups.
+Audit pass: no unwrap/expect on fallible results outside tests and fixed
+      constants in the guard, tray and common code.
+
+Checks run here: cargo test --workspace (86 tests: 5 common, 70 guard, 11
+tray; 6 clean runs), clippy -D warnings (Linux, all targets) and for
+x86_64-pc-windows-msvc (the Windows-only block_floor included), cargo fmt
+--check, PowerShell static checks, ASCII + CRLF. Not run here: anything on
+Windows - block_floor against a real firewall, the tray note, the new Phase 5
+attribution. The reviewer's Windows gate (RELEASE-CHECKLIST.txt, 4) is the
+remaining work before calling this final.
+
+=====================================================================================
+ROUND 8 - release review of v0.6.3 (V63-01 .. V63-05) + the reviewer's proposed
+          hotfix diff (PiaLite-v0.6.3-reconnect-hotfix.diff)  -> v0.6.4
+=====================================================================================
+The proposed diff arrived after the same fixes had been written here. It was
+compared point by point; v0.6.4 keeps the version below for each item, and
+takes over the reviewer's deterministic test hook (pause_before_pia_cmd: the
+worker signals the moment it waits for its turn - instead of a fixed sleep).
+
+V63-01 P1 restart checked before waiting its turn   AGREED. run_restart takes
+      pia_cmd, THEN re-runs kick_still_valid (stop flag, same attempt, PIA
+      still trying, block on, no hotel/restore, user didn't press
+      Disconnect) right before "disconnect"; the "why" line is logged only
+      after that check (the proposed diff logged it before waiting - a
+      restart that then didn't happen still left a log line). Test
+      a_restart_waiting_its_turn_checks_again: lock held, worker queued
+      (hook), then PIA connects / newer attempt / block off / hotel login /
+      Disconnect pressed -> nothing sent; control case -> restart runs.
+      Mutation check: removing the re-check fails it.
+V63-02 P2 "Connected" heartbeats ended the user's Disconnect   AGREED,
+      different rule than the proposed diff. Proposed: clear only on a
+      direct Disconnected -> Connected step. PIA normally goes Disconnected
+      -> Connecting -> Connected, so that step is rarely seen: a connection
+      made in PIA's own app would end the user's "off" only sometimes
+      (depending on which states the monitor happened to report). Here:
+      after the note, the guard waits until PIA is seen NOT connected; the
+      next Connected after that is a new connection and ends it. More
+      Connected reports from before the disconnect took never do. Also (as
+      proposed): every user command bumps the attempt number, so a restart
+      decided before it is stale. Starting a hotel login clears the "off"
+      (that flow ends with a reconnect by design). Policy test extended
+      (Connected -> Disconnect -> Connected, Connected -> Disconnected ->
+      Connecting -> still off -> Connected -> over; Connect makes an older
+      restart stale). Mutation checks: both rules fail the test when
+      removed.
+V63-03 P2 tray note and piactl unordered   AGREED. One worker, in order: the
+      note (bounded 2 s, one retry), then piactl. A note that doesn't
+      arrive is logged and shown ("Guard: ...") and Disconnect still goes to
+      PIA. Different from the proposed diff: no note when the tray knows no
+      guard is running (tray-only installs would otherwise show a "guard
+      notification failed" warning on every click), and one retry. Test
+      the_guard_hears_the_users_choice_first (order, failure + retry, a
+      failing piactl step stops the rest). The existing "one command at a
+      time" flag still rejects overlapping clicks.
+V63-04 P2/P3 hotel reconnect outside the queue   AGREED. The reconnect takes
+      pia_cmd and then checks: guard not stopping, still the latest hotel
+      login and it is over, restore done, no Disconnect pressed, PIA not
+      already connected or connecting (the proposed diff skipped only
+      Connected). Test hotel_reconnect_waits_its_turn_and_checks_again
+      (FakePia end to end, lock held: nothing while it waits; PIA connected
+      meanwhile -> no connect; Disconnect pressed -> no connect; nothing
+      changed -> connects). Mutation checks: dropping the lock or either
+      check fails it. hotel_start's own disconnect is still outside the
+      queue (as in the proposed diff); a queued restart sees the hotel login
+      and stops.
+V63-05 P3 any temporary permit under our name accepted   AGREED (the
+      proposed diff left it). open_all now records the ids of the two
+      allow-all filters it adds (OWN_ALLOW_ALL, removed when dropped). In
+      block_floor a temporary permit in our sublayer or under our name is
+      accepted only if is_own_allow_all: an id this guard holds right now,
+      our sublayer, weight 15, no conditions, no weakening flags - anything
+      else makes the floor fail ("can NOT be confirmed"). Unit test of the
+      predicate (8 cases) and a stub case in
+      a_failed_rule_refresh_never_strands_the_vpn. The real Windows check
+      needs the release gate (an admin test adding a stray dynamic permit).
+
+Test-suite robustness (found here while checking this round): running the
+guard tests in shuffled orders showed three timing-dependent TESTS (not
+product faults): the guard's own 1-second tick could retry the failed
+rule install, ask PIA to connect, or look at the adapters between a
+test's steps (one of them, the adapter test, dates from v0.6.0). Tests
+that check one decision at a time now pause that tick (test-only
+switch), the stub can fail the next N installs, and the network-wait
+test also accepts "the tick already asked". All 40 shuffled orders pass.
+
+Checks run here: cargo test --workspace (90 tests: 5 common, 73 guard, 12
+tray; 6 clean runs + 40 shuffled orders of the guard tests), clippy
+-D warnings (Linux all targets; and x86_64-pc-windows-msvc), cargo fmt
+--check. Not run here: anything on
+Windows. Per the review: features frozen after this; next is the Windows
+release gate (RELEASE-CHECKLIST.txt, 4).
+
+=====================================================================================
+ROUND 9 - release review of v0.6.4 (V64-01 .. V64-05)  -> v0.6.5
+=====================================================================================
+Small patches, each with a test that fails without it (mutation-checked).
+Per the lessons from earlier rounds, each fix also looked for the same
+CLASS of problem elsewhere.
+
+V64-01 P2 "unreachable" counted as a disconnect   AGREED. Only a reported
+      "Disconnected" (or PIA already Disconnected when the user pressed
+      Disconnect) arms "the next Connected is a new connection"; None and
+      "Disconnecting" don't. A failed piactl disconnect (PIA stays
+      Connected) keeps the user's choice. Test
+      an_unreachable_moment_does_not_end_the_users_disconnect (Connected ->
+      Disconnect -> None -> Connected stays off; Disconnecting -> Connected
+      stays off; failed disconnect stays off; real Disconnected ->
+      Connecting -> Connected ends it). Class check: the other places that
+      read "not Connected" use it to block more, never to relax.
+V64-02 P2 hotel return trusted a pre-hotel report   AGREED. New
+      Policy::fresh_state (reported since the last boot/wake/hotel end and
+      not stale). The hotel return uses it; with no fresh report it asks PIA
+      (PiaOps::state, outside the policy lock), records the answer, then
+      decides; if PIA can't be asked it connects (harmless when already
+      connected). Test hotel_return_does_not_trust_a_report_from_before_it_
+      ended (pre-hotel Connected -> asks -> connects; can't ask -> connects;
+      fresh Connected after the end -> no connect, PIA not asked). Class
+      check: spawn_connect also read the last report without freshness - now
+      needs a fresh "Disconnected"; the restart worker already compared with
+      its own send time.
+V64-03 P2 tray skipped the note on a missing cached status   AGREED. The
+      note is always tried, first, on the same worker. If no guard is
+      installed (no cached status AND no pialite-guard.exe), a failure is
+      silent; otherwise it is shown. An absent pipe fails at once, so
+      tray-only installs don't wait. Test extended (quiet step tried first,
+      silent failure; note delivered while the status isn't polled yet).
+V64-04 P2 hotel entry outside the PIA command queue   AGREED - and the
+      DESIGN text was wrong (it said "under the command lock"; that was the
+      other lock). hotel_start now takes pia_cmd right after op, before
+      reading or changing anything, waiting at most 20 s (else "busy",
+      nothing written or sent). Lock order everywhere: op -> pia_cmd ->
+      policy, the policy lock never held across piactl. Test
+      hotel_entry_waits_its_turn_at_pia_commands (FakePia: nothing sent and
+      no recovery note while another command holds the turn; then the full
+      entry; held past the bound -> "busy", nothing changed). Not queued:
+      the kill switch restore (a settings change, not a connection change)
+      - documented.
+V64-05 P3 allow-all id registry windows   AGREED (small). The ids are
+      registered inside the transaction, right after each filter is added
+      (before it can take effect), removed again if the change isn't
+      saved; on drop the engine session (and with it the filters) closes
+      FIRST, then the ids are forgotten. Windows-only code; compile-checked.
+
+Checks run here: cargo test --workspace (93 tests: 5 common, 76 guard, 12
+tray; 6 clean runs + 40 shuffled orders of the guard tests), clippy
+-D warnings (Linux all targets; x86_64-pc-windows-msvc), cargo fmt
+--check. Not run here: anything on Windows. Source frozen apart from
+fixes found by the Windows release gate (RELEASE-CHECKLIST.txt, 4).
+
+=====================================================================================
+ROUND 10 - release review of v0.6.5 (V65-01 .. V65-04)  -> v0.9.0
+=====================================================================================
+V65-01 P2 hotel-return probe could decide on a stale answer   AGREED. The
+      answer from PIA is recorded through observe() (which rejects it if a
+      newer monitor report arrived while asking); the decision is then made
+      inside the policy lock from fresh_state() - the newest ACCEPTED
+      report - never from the local copy of the answer. Test
+      hotel_return_does_not_trust_a_report_from_before_it_ended, cases A
+      (newer Connecting while PIA answers Disconnected -> no connect) and B
+      (newer Disconnected while PIA answers Connected -> connect), with the
+      monitor event injected DURING the query.
+V65-02 P2 failed hotel-return connect: no retry, no status   AGREED.
+      run_hotel_reconnect returns HotelReturn {NotNeeded, Sent, Failed}.
+      A failed connect is retried after 5 s and 15 s, each time only if the
+      same hotel session is still current, the user hasn't disconnected, and
+      a fresh state (asked again first - a timeout doesn't prove nothing
+      happened) still says it's needed; every attempt holds the PIA command
+      turn. If all fail: a notice in the status and the tray ("The VPN
+      didn't reconnect after the hotel login (...) - press Connect"),
+      cleared by the next Connected. Test hotel_return_retries_a_failed_
+      connect_and_says_so (fail -> retry -> success; all fail -> notice,
+      gone once Connected; PIA connecting after a failed try -> not sent
+      again; a user Disconnect between tries stops the retries).
+V65-03 P3 stale cached Disconnected could end the user's Disconnect
+      AGREED. note_user() now starts with "not seen down"; only a
+      Disconnected REPORTED AFTER the press arms "the next Connected is a
+      new connection". Trade-off (documented): pressing Disconnect while PIA
+      is truly already down needs the user's own Connect (which always clears
+      it) - the safe direction. Tests updated
+      (a_user_disconnect_stops_automatic_connects, an_unreachable_moment_
+      does_not_end_the_users_disconnect, plus Disconnected -> press ->
+      Connected stays off).
+V65-04 P3 "guard absent" decided by file presence   AGREED. The tray asks
+      the service manager whether PiaLiteGuard is registered (Windows: SCM,
+      no process started; Linux: the systemd unit file) in addition to the
+      cached status and the program file; only when all three say "no guard"
+      is a failed note silent.
+
+0.9.0 (public release) - what else changed, for the next reviewer
+- Features are optional (guard / encrypted DNS / hotel / autostart /
+  hide PIA's window) and chosen at install; `pialite-guard setup` and
+  `teardown` (setup.rs, sys.rs) replace the PowerShell installers and are
+  run by the MSI (WiX custom actions), the .deb/.rpm scripts, install.sh
+  and the tray's features window. install.json records kind + features.
+- DNS providers: Quad9, Cloudflare, AdGuard, Google, NextDNS, custom DoH.
+- Linux port: nftables backend (table inet pialite: chain "out" = the plan,
+  chain "open" = the guard's own allow-all; verify loads the plan into a
+  hook-less scratch table so nftables normalises both sides the same way);
+  boot protection by pialite-boot.service before network-pre.target;
+  fail-closed on crash by ExecStopPost firewall-close; DNS by an nftables
+  redirect of port 53 to the proxy (only while the proxy listens), PIA's
+  group exempt; control socket with SO_PEERCRED (root = admin, group
+  "pialite" = user). selftest-firewall FOUND two real bugs before release:
+  the listing parser kept the chain header as a rule, and a redirected DNS
+  packet keeps its original outgoing interface in the filter hook (so the
+  loopback rule is now "fib daddr type local", not oifname "lo").
+- Updates (update.rs): GitHub releases, ed25519-signed SHA256SUMS, key
+  built in; installs only signed releases; download into the admin-only
+  data folder; MSI run from a copy outside the install folder.
+
+Checks run here: cargo test --workspace (5 common, 90 guard, 15 tray),
+clippy -D warnings (Linux, all targets), cargo fmt --check, and on a real
+kernel in a network namespace: selftest-firewall (all PASS) and an
+end-to-end run of the Linux guard (run, status, show-rules, DNS redirect
+answered by the proxy, SIGTERM + firewall-close, unlock). Windows: built
+and tested by CI (GitHub Actions windows-latest), including a real WFP
+self-test and an MSI install/uninstall; the Windows release gate on a real
+PC is still required (RELEASE-CHECKLIST.md).

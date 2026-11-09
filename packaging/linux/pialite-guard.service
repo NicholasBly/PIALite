@@ -1,0 +1,15 @@
+[Unit]
+Description=PIA Lite guard (kill switch, encrypted DNS, hotel login)
+Documentation=https://github.com/NicholasBly/PIALite
+After=pialite-boot.service network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pialite-guard run
+# the temporary allow-all and the DNS redirect go with the service - also after a crash
+ExecStopPost=/usr/bin/pialite-guard firewall-close
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

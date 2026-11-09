@@ -1,0 +1,118 @@
+name: Release
+
+# Push a tag like v0.9.0 (matching the version in Cargo.toml): the Windows
+# and Linux files are built and tested, SHA256SUMS is signed (if the
+# RELEASE_SIGNING_KEY secret is set) and the GitHub release is published.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Version matches the tag
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path pialite-guard\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "tag ${{ github.ref_name }} doesn't match Cargo.toml version $v" }
+          "VERSION=$v" | Out-File -Append $env:GITHUB_ENV
+      - run: cargo test --workspace
+      - run: cargo build --release
+      - name: Firewall self-test (real WFP)
+        run: .\target\release\pialite-guard.exe selftest-firewall
+      - name: WiX Toolset
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+      - name: MSI and portable zip
+        shell: pwsh
+        run: |
+          ./packaging/windows/build.ps1 -Version $env:VERSION
+          wix msi validate (Get-Item dist\*.msi).FullName
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Version matches the tag
+        run: |
+          v=$(grep -m1 '^version' pialite-guard/Cargo.toml | cut -d'"' -f2)
+          [ "v$v" = "${{ github.ref_name }}" ] || { echo "tag ${{ github.ref_name }} doesn't match Cargo.toml version $v"; exit 1; }
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig1-dev nftables rpm iproute2
+      - run: cargo test --workspace
+      - run: cargo build --release
+      - name: Firewall self-test (real nftables)
+        run: sudo unshare --net ./target/release/pialite-guard selftest-firewall
+      - run: packaging/linux/build-packages.sh "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - name: Sign the checksums (the updater installs only signed releases)
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::warning::RELEASE_SIGNING_KEY is not set - this release is NOT signed; the updater will only point to the download page"
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/key.pem" -rawin -in dist/SHA256SUMS -out dist/SHA256SUMS.sig
+          rm -f "$RUNNER_TEMP/key.pem"
+          # must match the public key built into the programs
+          { printf '\060\052\060\005\006\003\053\145\160\003\041\000'; base64 -d keys/release-signing.pub; } > "$RUNNER_TEMP/pub.der"
+          openssl pkeyutl -verify -pubin -keyform DER -inkey "$RUNNER_TEMP/pub.der" -rawin -in dist/SHA256SUMS -sigfile dist/SHA256SUMS.sig
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '$0 ~ "^## \\[?"v"\\]?" {on=1; next} on && /^## / {exit} on {print}' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "### Downloads"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Windows installer (choose features) | \`PIALite-$v-windows-x64.msi\` |"
+            echo "| Windows portable (tray only) | \`PIALite-$v-windows-x64-portable.zip\` |"
+            echo "| Debian / Ubuntu / Mint | \`pialite_${v}_amd64.deb\` |"
+            echo "| Fedora / openSUSE / RHEL | \`pialite-$v-1.x86_64.rpm\` |"
+            echo "| Any Linux (install.sh or portable) | \`PIALite-$v-linux-x86_64.tar.gz\` |"
+            echo
+            echo "Checksums: \`SHA256SUMS\` (signed: \`SHA256SUMS.sig\`, ed25519 key in \`keys/release-signing.pub\`)."
+          } >> notes.md
+          cat notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "PIA Lite ${GITHUB_REF_NAME#v}" --notes-file notes.md --verify-tag

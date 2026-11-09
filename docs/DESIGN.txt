@@ -1,0 +1,499 @@
+PIA Lite - safety design (v0.9.0)
+===============================
+
+Sections 1-12 describe the design as built and reviewed on Windows; "NextDNS"
+there stands for whichever DoH provider is chosen (0.9). Section 13 covers what
+0.9 adds: optional features, setup/teardown, Linux, and signed updates.
+
+What is protected, from what, and what is NOT claimed.
+
+1. Parts
+   pialite-tray   runs as you. Talks to PIA through PIA's own piactl, and to the guard.
+   pialite-guard  Windows service (LocalSystem). DNS proxy, internet block, hotel login.
+   pialite-common shared code: piactl runner with time limits, status format, IPC client.
+   PIA itself (daemon, WireGuard/OpenVPN, kill switch, split tunnel) is not modified.
+
+2. Threat model
+   Protects against:
+   - traffic leaving the PC before the VPN is up after boot, wake-up, or a PIA service
+     restart (block modes "startup" and "always")
+   - traffic leaving while the VPN is down at any time (mode "always")
+   - DNS lookups sent unencrypted: lookups that reach the guard go to NextDNS over
+     HTTPS with certificate checks; if NextDNS can't be reached the answer is SERVFAIL,
+     never a plain-DNS fallback
+   - other Windows accounts / remote machines using the guard (pipe access list)
+   - a normal (not elevated) program weakening the block: turning it down or off and
+     hotel login need an ELEVATED administrator (Windows' "Run as administrator"
+     prompt; the tray asks for it)
+   - a fake "guard" grabbing the pipe name (client requires a session-0 server;
+     approved accounts can't create pipe instances)
+   NOT protected / not claimed:
+   - malware running as YOU can still use the commands that don't need an
+     administrator: status, making the block stronger, ending a hotel login
+     (and PIA's own piactl, which could simply turn PIA off)
+   - malware running as an administrator: it owns the PC
+   - programs that bring their own DNS or DoH: they bypass 127.0.0.1 (PIA's DNS leak
+     protection still applies to plain DNS on port 53)
+   - hotel login: traffic goes OUTSIDE the VPN on purpose, for a few minutes
+   - split-tunnel "bypass" apps: they go outside the VPN by your own PIA setting
+   - "leak-proof": the guarantees below are what the code does and what the Phase 5
+     tests measure on this PC; they are not a formal proof
+
+3. Firewall rules (Windows Filtering Platform, outgoing traffic only, like PIA's)
+   One rule = one WFP filter with AT MOST ONE condition per field. Microsoft documents
+   conditions in a filter as ANDed (OR only on Windows 7), so every allowed PIA
+   program and every local-network range is a separate filter, on the IPv4 and the
+   IPv6 layer. A PIA program Windows can't identify is an error, not skipped.
+   boot-time   active from the moment the network driver starts until the firewall
+               engine (BFE) is up: allow loopback + DHCP, block everything else.
+               Built-in WFP objects only. Added in a separate step, then READ BACK
+               from Windows; if Windows refuses them or they don't read back as
+               planned, the status says so and the persistent block still works.
+   persistent  loaded by BFE: allow loopback, each PIA program, DHCP, each LAN range
+               only if PIA's Allow LAN is positively on (port 53 to the LAN stays
+               blocked); block the rest. Microsoft calls the switch from boot-time
+               to persistent filters atomic for "a provider [that] has both"; our
+               boot-time filters have no provider (built-in objects only), so for
+               this exact setup a gap-free switch is the design expectation, to be
+               confirmed by a boot capture - not a proven guarantee.
+   checked     every 30 s, between commands: each filter is read back and compared
+               with the plan - layer, action, flags (incl. "disabled"), weight
+               (type and value), provider, sublayer, and every condition's
+               field, match type and VALUE (app ID bytes, address/prefix, port).
+               Every other key in our ranges must be empty and our provider's
+               filters on the two layers we use (outbound connect, v4/v6 - other
+               layers aren't searched) are listed to find extra ones. Filter flags
+               that weaken a rule (disabled, clear-action-right, permit-if-callout-
+               unregistered) count as a difference. The provider and sublayer
+               OBJECTS are checked too (sublayer weight 0x7000, persistent, ours);
+               a changed one is replaced at the next install - and only then: a
+               normal refresh only replaces the filters (v0.6.1). Any difference ->
+               reinstalled and logged. "pialite-guard show-rules" prints all of it
+               as Windows holds it, plus the same check, and exits 1 if anything
+               differs from what should be there (Phase 5 includes it).
+   refresh     (v0.6.1, after a real lock-out in v0.6.0: Windows refused a
+   fails       refresh with "in use" and the guard then treated itself as not
+               armed, so it never added "allow all" - the VPN was connected but
+               the old block rules stayed.) Now, if a refresh fails, the guard
+               looks at what Windows still holds. Two separate answers (v0.6.3,
+               review FINAL-01):
+               - VERIFIED protection ("armed", what status and tray report):
+                 the planned rules exactly; or exactly the set the guard last
+                 verified; or the block-everything floor - our provider and
+                 sublayer as planned, an intact persistent unconditional
+                 BLOCK on BOTH IPv4 and IPv6, and nothing in our sublayer or
+                 under our name that isn't a rule of the plan (either Allow LAN
+                 choice) or of the last verified set. Otherwise "protection
+                 can NOT be confirmed" - never a green status.
+               A temporary permit-everything next to the floor counts only if
+               it is the guard's OWN allow-all: an id this guard added and
+               still holds, our sublayer, weight 15, no conditions, no
+               weakening flags (v0.6.4, review V63-05); any other temporary
+               permit there means "can NOT be confirmed". The ids are listed
+               before the change is saved and dropped only after the filters
+               are gone (v0.6.5, V64-05).
+               - Rules PRESENT (some PIA Lite rule, or Windows couldn't be
+                 asked): the VPN-connected "allow all" is still added, so a
+                 connected VPN is never left blocked. Only "Windows was asked
+                 and has no PIA Lite rules" adds nothing.
+               The guard keeps trying the refresh (every 30 s). The error is logged with the
+               firewall's own details (provider, sublayer, our filters by kind,
+               other PIA Lite firewall sessions with their process ids) - at most
+               every 10 minutes while it repeats - and the tray shows it. Why
+               Windows said "in use" is not known yet; that log line is there
+               to find out. "block lifted" is only logged when "allow all" was
+               really added.
+   "none?"     "no rules" is only ever said after Windows was actually asked;
+               "couldn't ask" is an error (check-rules fails, startup assumes
+               rules are present).
+   temporary   "allow all" held in the guard's own WFP session. Exists only while the
+               state machine says so. If the service dies Windows removes it: fail closed.
+               Decided and changed in one step while the state machine is locked, so a
+               stale "open" can't be applied after a newer "block"; it has its own lock,
+               so taking it away never waits for a slow firewall install or check.
+
+4. State machine (pialite-guard/src/policy.rs, unit tested)
+   Inputs: PIA state observations, each stamped with when it was taken (piactl monitor
+   events + an active check every 10 s with a 5 s time limit); sleep/wake events;
+   hotel start/stop/expiry; mode changes.
+
+     mode off      never blocks
+     mode startup  BLOCKED at service start, boot, wake, END OF A HOTEL LOGIN ("rearm")
+                     -> OPEN when PIA is seen Connected after that moment
+                     -> BLOCKED again if PIA's service is unreachable > 20 s,
+                        or no fresh observation for 30 s, or sleep/wake
+                   After it opens, a VPN drop is handled by PIA's kill switch -
+                   the tray warns when PIA's kill switch is not "Always".
+                   While PIA's kill switch isn't restored after a hotel login
+                   ("strict"), it behaves like "always".
+     mode always   OPEN only while PIA was seen Connected within the last 30 s AND
+                   PIA Lite has seen PIA's adapter for that connection up.
+                   Disconnected / Interrupted / Reconnecting / unreachable / silence
+                   / adapter not yet seen, down or not found -> BLOCKED immediately.
+     adapter       a second signal (v0.5: down only; v0.6 / review F51-07: a gate).
+                   Called "PIA adapter observed up" (review V60-08): it is what
+                   Windows reports about an adapter that looks like PIA's.
+                   Looked at the moment PIA reports Connected, every 200 ms until a
+                   PIA adapter (wgpia0, or one described as Private Internet Access)
+                   is seen up, then every second. States, shown in the status as
+                   tunnel_watch: checking -> up; up -> down if it goes down or
+                   disappears; "not-found" if none of PIA's adapters is up 3 s after
+                   Connected; "query-failed" keeps the last state. Mode always
+                   needs "up" to open. Mode startup keeps its meaning (PIA takes
+                   over once connected): only an adapter already known to be down
+                   or missing stops the hand-off; after it, the adapter is not used.
+                   An adapter PIA Lite doesn't recognise as PIA's never counts as
+                   up - mode always then keeps blocking (status/tray say so; use
+                   mode startup on such a setup). It narrows, not closes, the gap:
+                   "up" is what Windows reports, not proof of a working tunnel.
+                   Information only (v0.6.1): whether Windows' best route to
+                   NextDNS's address goes through that adapter (route_via_vpn
+                   in the status; "no" is shown as a warning, never used to
+                   open or block).
+     network       PIA is asked to connect (after boot/wake) once a network is up -
+                   an adapter that isn't PIA's, with a ready, non-link-local address
+                   and a gateway - or after 30 s without one, counted from the
+                   boot/wake (rearm) or from when the network went away,
+                   whichever is later - never from how long PIA has been in its
+                   state (review V60-05). PIA retries a failed
+                   attempt after 1 s twice, then only every 10 s (its source,
+                   common/src/vpnstate.h), and does not retry when the network
+                   appears (daemon.cpp onNetworksChanged only records it); a
+                   "connect" while it is connecting is ignored (vpn.cpp
+                   connectVPN). So if the network comes up while PIA has been
+                   retrying since before, its attempt is restarted (disconnect,
+                   wait for Disconnected, connect): once per network-up, at most
+                   every 15 s, only while the guard blocks for want of the VPN
+                   (before the hand-off, or in mode always). It never lifts a block.
+                   A restart belongs to the attempt it was meant for (a number
+                   that changes with every new connecting episode) and runs one
+                   at a time (review V60-01). It is dropped if, by the time it
+                   runs, PIA is no longer stuck in that attempt or the block is
+                   no longer the guard's business; after "disconnect" it
+                   connects only once PIA was seen Disconnected, and gives up
+                   if PIA reports Connected/Connecting/Reconnecting instead -
+                   nothing is sent blindly after a timeout. So a connection
+                   that succeeds meanwhile is never cut, and a disconnect you
+                   make yourself is never undone. v0.6.3 (review FINAL-02): a
+                   failed "disconnect" ends it (a Disconnected seen next could
+                   be anyone's); the last check (same attempt, still allowed)
+                   is right before "connect"; guard-started PIA commands run
+                   one at a time, and the startup connect waits while a
+                   restart runs (in v0.6.2 both connected at once - piactl
+                   then timed out and the connect took ~5 s longer). The tray
+                   tells the guard when you press Connect/Disconnect: after a
+                   Disconnect the guard neither connects nor restarts until you
+                   connect again, PIA is seen connected, or the next boot/wake.
+                   (Anyone may send that note: it can only make the guard less
+                   eager to connect, never lift a block.)
+                   v0.6.4 (review V63-01..04): a restart checks again AFTER it
+                   gets its turn at PIA commands, right before "disconnect";
+                   the tray sends its note FIRST and waits for the answer,
+                   then runs PIA's command on the same worker (no note if no
+                   guard is running; one retry; a note that doesn't arrive is
+                   shown, Disconnect still happens); more "Connected" reports
+                   from before your Disconnect took don't end it - only a new
+                   connection after PIA was seen not connected, Connect in
+                   the tray, a hotel login, or the next boot/wake; any user
+                   command makes a restart decided before it stale; the
+                   reconnect after a hotel login takes its turn like the
+                   others and checks again (still the latest login, restore
+                   done, no Disconnect pressed, PIA not already connected or
+                   connecting).
+                   v0.6.5 (review V64-01..04):
+                   - "PIA's service unreachable" proves nothing: the user's
+                     Disconnect ends only after PIA was seen DISCONNECTED
+                     (or already was when pressed) and then connects again.
+                   - Decisions use only FRESH reports (since the last
+                     boot/wake/hotel end, not stale): the hotel return no
+                     longer trusts a "Connected" from before the hotel login
+                     - without a fresh report it asks PIA; the startup
+                     connect needs a fresh "Disconnected".
+                   - The tray always tries its note; a failure is shown
+                     unless no guard is installed at all.
+                   - Hotel entry takes its turn at PIA commands too (waits
+                     at most 20 s, else "busy" with nothing changed). Lock
+                     order everywhere: op -> pia_cmd -> policy; the policy
+                     lock is never held during a piactl call. Commands that
+                     only change PIA's kill switch setting (the restore) are
+                     not in that queue - they don't change the connection.
+     hotel         OPEN until it ends (any mode). Each login has a number; a late
+                   timer can only end its own login, never a newer one, and "is it
+                   due?" + "end it" are one step under one lock. Ending it
+                   - by hand or timer - re-arms first ("restoring": nothing opens,
+                   not even for a Connected report, until the kill switch restore
+                   was tried; no hand-off counts from that time).
+     strict        from BEFORE a hotel login relaxes PIA's kill switch until it is
+                   verified back: off and startup behave like always (in mode off
+                   the block rules are installed for that time).
+
+   Never used as evidence: OS uptime, observations older than the last rearm.
+
+5. Hotel login transaction
+   needs an elevated administrator. Undo any earlier login's change first (so its
+   "was on" note can't be overwritten) -> check PIA answers + read kill switch ->
+   write the recovery record (hotel-recovery.json, its own file, never rotated with
+   the settings backups) and the note in guard.json (both durable) -> if it is
+   "on": the guard takes
+   over (strict, rules in place) -> kill switch "on" -> "auto", read back ->
+   disconnect -> open. Any failure undoes the earlier steps.
+   End (one path for the button and the timer, one command at a time):
+     1. re-arm: the temporary allow-all goes; the block is checked in Windows
+     2. kill switch put back and READ BACK; only then the record + note are cleared;
+        "done" also needs the guard's rules to be back in line (else it says so)
+     3. reconnect the VPN
+   If step 2 fails: the note stays, the guard retries every 30 s, it blocks whenever
+   the VPN is down until then ("strict", in every block mode including off), the
+   tray shows a warning, hotel start is refused, uninstall stops.
+
+6. Settings (C:\ProgramData\PiaLite, SYSTEM + Administrators write, Users read)
+   guard.json written durably (temp file, flush, keep last good copy, rename).
+   Missing OR damaged file -> last good copy; if none and block rules are installed
+   -> keep the block (mode "startup"); shown as a problem in the status. Only "no
+   file, no backup, no rules" counts as a fresh install (block off). An unfinished
+   hotel restore is read from hotel-recovery.json first, so an older guard.json.bak
+   can never make it look finished. The record has one strict format (review
+   F51-01): {"version":1,"hotel":<1..2^53-1>,"saved_killswitch":"on|auto|off"},
+   no other fields ("version" may be missing: v0.5). A damaged or odd record, or
+   one that disagrees with guard.json's note, is "unknown": the guard restores
+   "on", the uninstaller asks you. Both readers (Rust, PowerShell) are checked
+   against the same 50 cases (scripts\recovery-fixtures.json; Rust in cargo test,
+   PowerShell in the Phase 5 quick checks). A name that appears twice - also
+   differing only in case, which Windows PowerShell 5.1's ConvertFrom-Json would
+   merge - or that is written with an escape, and a record over 4 KB, make it
+   "unknown" in both readers (review V60-11).
+   Who may change the files (review F51-02): the installer gives the folder a
+   complete permission list of its own - SYSTEM + Administrators full, Users
+   read, "OWNER RIGHTS" read (so even a file owned by your own account can't
+   have its permissions changed without admin) - removes every other entry,
+   re-owns everything inside to Administrators and resets it to inherit only
+   that, then checks every file. Settings/records owned by another account are
+   refused (the install stops and says which). C:\Program Files\PiaLite is reset
+   to Program Files' own permissions and checked the same way. Users keep read
+   access on purpose: the tray installer reads your saved NextDNS ID, and you
+   can read guard.log without admin.
+   Block mode changes are applied in Windows FIRST and saved after; if either fails,
+   both go back to the old mode; asking for the mode already in force only checks
+   it. While the service runs it is the only writer. Commands wait at most 15 s for
+   the one before them, then answer "busy".
+
+7. Control pipe  \\.\pipe\PiaLiteGuard
+   Access list: SYSTEM and Administrators full; the installing user's SID gets only
+   read data / write data / read attributes / synchronize (0x100083) - not
+   FILE_APPEND_DATA, which for pipes means "create a pipe instance". No approved
+   account recorded -> nobody else (no "interactive users" fallback). First-instance
+   flag, remote clients rejected, max 4 clients at once. Every client has a hard time
+   budget: 5 s to send its request, 2 s for the reply to be handed over, 3 s to read it
+   and hang up; all pipe I/O is overlapped and cancelled when the time is up (no
+   blocking FlushFileBuffers). 512-byte requests, versioned protocol ("2 <command>").
+   Needs an ELEVATED administrator (checked from the caller's Windows token):
+     mode down (always -> startup -> off), unlock, hotel start, set-profile,
+     set-users, reload, "seen" (DNS check)
+   Anyone approved: status, ping, whoami, mode up, hotel stop.
+   "pialite-guard pipe-selftest" (run by Run-Phase5.bat before it asks for admin)
+   checks this as a normal user: no second pipe instance, unlock refused, and four
+   stuck clients don't lock out a fifth.
+   Clients have a deadline too: overlapped I/O, 60 s per command (8 s for the tray's
+   status polls); a command that timed out on the client may still finish in the
+   service - the status shows the result. The access list is built when the service
+   starts; a change of the approved accounts applies after a restart. If the service
+   is stuck, "unlock" (Unlock-Internet.bat) stops it, removes the rules directly and
+   starts it again.
+
+8. DNS proxy
+   127.0.0.1:53 UDP+TCP -> DoH POST to dns.nextdns.io at fixed anycast IPs, TLS via
+   rustls + public roots, keep-alive pool of 4. Answers must have content type
+   application/dns-message, ID 0, QR set, same question - else SERVFAIL.
+   A failure at ANY step (TCP, TLS handshake, certificate, HTTP status, bad answer)
+   moves on to the next bootstrap address, within 8 s per lookup in total - a real
+   deadline: every socket read/write gets only what is left of it, so a server that
+   drips one byte at a time is cut off, and each address gets a fair share of the
+   time left. Same host name and full certificate check for every address; a
+   certificate failure is logged on its own (possible interception). The last
+   address that worked goes first.
+   HTTP parsing is bounded (8 KB headers, 64 KB-1 body, chunk framing verified).
+   When the VPN connects, one connection is opened in advance (saves the first
+   lookup's TLS handshake). It belongs to that network: one at a time, and it
+   joins the pool only if the network didn't change while it was being made
+   and the pool is still empty (review V60-09).
+   Health is rated over the last 20 lookups: untested / ok / degraded / down.
+   The last 256 query names are kept only as keyed hashes (random key per run), so
+   "test-dns" can ask "did Windows' resolver really send you this one-off name?"
+   without the guard keeping a readable history.
+
+9. test-dns says what it proves
+   proxy      a lookup through 127.0.0.1 is answered by the guard
+   encrypted  NextDNS's own test page saw our lookup as DoH through NextDNS
+   os         a random one-off name looked up through Windows' resolver (what
+              browsers use) reached the guard
+   profile    match (page names it, or a --canary domain on YOUR Denylist came back
+              blocked while NextDNS without a profile resolves it) / mismatch
+              (fails) / unknown (NextDNS shows only an anonymous fingerprint -
+              reported as NOT confirmed, never as a match)
+
+10. Install / uninstall
+   Staged; each stage verified; nothing touches working DNS until NextDNS was reached
+   directly. Stages 3-5 are one undoable step: every change to the live setup - the
+   guard program, guard.json and the service (an upgrade keeps copies of the
+   previous program and settings), the NextDNS app, PIA's DNS - is written to an undo
+   list - in memory and in C:\ProgramData\PiaLite\install-undo.txt, replaced whole
+   by rename - BEFORE it is made. ANY failure in stages 3-5 undoes the list newest
+   first (an upgrade gets the previous guard back and running), reconnects, and
+   checks a real lookup; "rolled back" or "rollback incomplete" (with how to unlock
+   the internet if you are offline) is said plainly. An install cut off halfway is
+   undone at the start of the next run - but first (review V60-02), before anything
+   in C:\ProgramData\PiaLite is read, replayed or copied, a READ-ONLY check: no
+   junction or symbolic link anywhere in it (never followed - the folder is walked
+   without entering them), and the folder, every folder in it and every file PIA
+   Lite acts on owned by SYSTEM / Administrators / the installing admin and not
+   changeable by anyone else. If that fails the install or uninstall stops,
+   changes nothing and says what it found and what to do. Then the folder is
+   locked down (created locked if it is new) - before the undo list or any saved
+   copy is written - and only then is the undo list read: every line must be
+   exactly one of the forms the installer writes (at most 10 lines), or nothing
+   is undone. An upgrade's saved program is used only if its SHA-256 matches the
+   undo list. The program folder is checked for links before its permissions
+   are reset. Stage 5 requires
+   Windows' resolver to be proven to use the guard (override -AllowUnverifiedResolver).
+   Stage 6 (Fast Startup, removing the NextDNS app - permanent, asked) is
+   best-effort: a problem there is reported and the working install stays.
+   An upgrade's undo restores the previous program (checked against its SHA-256),
+   guard.json AND guard.json.bak exactly - same bytes, or absent if they didn't exist.
+   Finishing (review F51-04): the undo list is overwritten with "done" (flushed,
+   renamed - must succeed) BEFORE the saved copies are deleted; a "done" list left
+   behind only makes the next run tidy up, never undo with copies that are gone.
+   Every program the scripts run has a time limit (piactl, the guard, sc.exe,
+   services, the NextDNS uninstaller); a timeout is a failure like any other.
+   The limit covers the program ending AND its output being read (review F51-06),
+   plus up to ~8 s to stop what is still running after it (review V60-10):
+   a timed-out program is stopped with everything it started, and a program that
+   ends but leaves a child holding its output open counts as a timeout too - that
+   child is stopped. Output is read in pieces, kept up to 4 MB per stream (more is
+   read and dropped, and the result says it was cut); output that can't be read is
+   a failure, never a silent empty answer (review V60-07). Not a Windows job
+   object: a program started by a child after it was found can outlive this. One
+   copy of this code (scripts\PiaLite-Common.ps1) for the installer and the tests.
+   A second copy of the guard lives in C:\ProgramData\PiaLite\recovery (admin-only).
+   Uninstall picks ONE guard program first - installed, recovery copy, or the fresh
+   build - and uses it for every step: each candidate must exist, match the
+   SHA-256 recorded when the install finished (C:\ProgramData\PiaLite\guard.sha256;
+   not for the fresh build) and answer "version" (review F51-05). A broken one is
+   skipped with the reason shown; if none works it stops before changing anything
+   (rules outlive the program). It stops at the first critical failure
+   (kill switch, block rules, PIA's DNS) and keeps everything needed to retry. If
+   the hotel records can't settle whether a restore is outstanding (damaged record,
+   or guard.json unreadable - an older .bak is not proof), nothing is deleted until
+   you have checked PIA's kill switch and typed YES. Other leftovers (a file in use,
+   the service marked for removal, the NextDNS app not starting) are checked and
+   listed at the end - it only says "removed completely" when verified.
+   Unlock-Internet.bat uses the installed guard - or, if that is missing or fails,
+   its recovery copy; with neither working, it says the rules may still be there
+   and how to get the program back - never "nothing to unlock".
+   The tray starts at sign-in from a scheduled task ("PIA Lite Tray": the user's
+   own account, no admin rights, no time limit) instead of the Run key, which
+   Windows holds back until the desktop settles; the Run key is the fallback.
+   Starting that early has a catch (v0.6.2, found on Windows 11): the taskbar may
+   not exist yet, and Slint adds the tray icon once, silently giving up if that
+   fails, from a message-only window that never hears Windows' "TaskbarCreated"
+   broadcast - the tray ran with no icon. Now the tray waits for the taskbar (up
+   to 30 s), keeps its own hidden window that hears "TaskbarCreated" (Explorer
+   started or restarted) and adds the icon again, checks every 5 s that its icon
+   window exists (retrying at once, then every minute), and starting PIA Lite
+   again while it runs asks the running copy to add its icon back - or, if the
+   icon is there, to open the panel. Known limit (review FINAL-04): the check
+   sees Slint's icon window, not Explorer's list of icons. The wait for the
+   taskbar happens before the tray's workers start (FINAL-05) - instant when
+   the taskbar is there; kept as is unless a slow start is measured.
+
+11. Verification (Run-Phase5.bat)
+   Quick checks + a startup leak test using Windows' firewall audit log (program names)
+   and a packet capture that starts before the firewall engine. A capture that saw no
+   packets, or none of PIA's own traffic (no positive control), is INCONCLUSIVE, never
+   a pass. PIA's own traffic = packets to an address + port + protocol the firewall
+   audit saw a PIA program connect to (v0.6.3, review FINAL-03: UDP port 1337 alone
+   no longer counts); a PIA address on another port, or UDP 1337 elsewhere, is
+   "unsure" -> INCONCLUSIVE, never
+   a pass. The capture marks each packet sent/received and, on Wi-Fi, records raw
+   802.11 frames; both are read as such (v0.5.1 - before, Wi-Fi frames were read as
+   Ethernet, so a Wi-Fi capture never showed this PC's packets).
+   The capture analysis also checks its own coverage (review V60-06): the read
+   limit (400,000 events) being reached before the VPN connected, events ending
+   early (file full, capture stopped) or starting after the network did make it
+   INCOMPLETE - then "nothing but PIA" is INCONCLUSIVE, not a pass. It reports the
+   first/last event, the longest stretch without events and packets per adapter.
+   Evidence for the time before the guard runs (review F51-08/F51-09) - still to be
+   collected on Windows, not claimed:
+   - option 5 sends known IPv4/IPv6 packets during a short capture and requires
+     the same analysis to find them (positive control for this PC's adapter and
+     frame format); it prints one anonymized frame of each (MACs and this PC's
+     address zeroed) as a test case for the analysis.
+   - at every start the guard logs what Windows held BEFORE it changed anything:
+     provider/sublayer state, the stored rules against the plan, their run-time
+     ids. The leak test reports it as an observation only (INFO "stored rules
+     were present and matched": seen once the filtering engine was running, it
+     doesn't show anything was blocked before - review V60-03), says whether the
+     network was up before the guard started, and counts which blocks were
+     decided by a PIA Lite rule (the audit log's FilterRTID).
+   - "Protection before the guard started" is a PASS only with all of: a network
+     up before the guard started, attempts in that time, at least one blocked
+     by a stored PIA Lite rule, nothing reaching the internet (audit), and a
+     capture that saw PIA's own packets and covered that time with nothing else
+     leaving. Anything missing -> INCONCLUSIVE, listing what; anything out ->
+     FAIL. The timeline also shows when the filtering engine (BFE) and PIA's
+     service started (their programs' start times).
+   - the leak test can hold the guard back (delayed start, ~2 min): then any
+     block before it starts is the stored rules alone - or PIA's own kill
+     switch, which the attribution tells apart.
+   The boot -> engine hand-off of the boot-time rules is still a design
+   expectation: these runs show the state when the guard starts and what the
+   capture saw, which proves the hand-off only on a run where the network was
+   up during it. The provider has no serviceName - deliberately unchanged until
+   tested (review F51-08).
+
+13. 0.9: optional features, Linux, updates
+   Features. guard (service + kill switch), dns, hotel, autostart, hidepia are
+   chosen at install. guard.json "features" = {dns, hotel}; a file without it
+   (older versions) means both on. install.json (data folder, readable by all)
+   records kind (msi/portable/deb/rpm/tarball/source), version and features -
+   the updater installs the same kind with the same features.
+   setup / teardown (pialite-guard). One implementation for every installer:
+   MSI deferred custom actions (setup after InstallFiles; teardown before
+   StopServices on removal, not on upgrades; teardown also as rollback of a
+   first install), .deb/.rpm maintainer scripts, install.sh, the tray's
+   features window (elevated with UAC / pkexec; only fixed words on the
+   command line). The service must run from a folder only administrators /
+   root can change (Program Files or the MSI folder, which setup protects;
+   Linux: every path component root-owned and not group/other-writable).
+   teardown order: stop the guard -> remove the block -> check it is gone
+   (else stop: never leave rules without the program) -> PIA's DNS, kill
+   switch (unfinished hotel login) and startup task back -> service removed.
+   Linux kill switch. nftables table inet pialite: chain "out" (hook output,
+   priority filter, policy accept) holds the plan, highest weight first; the
+   preamble (IPv6 neighbour discovery, jump to "open") follows the loopback
+   rules. "Loopback" = fib daddr type local (a DNS packet redirected to the
+   proxy keeps its original outgoing interface in this hook). PIA gets out by
+   its daemon's group (piavpn) and the mark on its kernel WireGuard packets
+   (12819 = PIA's linuxFwmarkBase + 2). Verification loads the expected rules
+   into a hook-less scratch table so nftables writes both sides in its own
+   normal form, then compares rule by rule; chain "open" may hold only the
+   guard's own allow-all (by handle). Boot: the same rules saved to
+   /var/lib/pialite/firewall.nft (0600) and loaded by pialite-boot.service
+   (DefaultDependencies=no, before network-pre.target). Crash: systemd runs
+   "firewall-close" after the service stops (ExecStopPost) - the allow-all
+   goes, the block stays: fail closed, like the Windows dynamic session.
+   Linux encrypted DNS. Table inet pialite_dns: port 53 from any program is
+   redirected to 127.0.0.1:53, except loopback destinations (the proxy, the
+   systemd-resolved stub) and PIA's group; IPv6 DNS is refused. Installed only
+   while the proxy listens (a proxy that can't bind port 53 must not take DNS
+   down with it), removed when the guard stops.
+   Linux control channel. /run/pialite/guard.sock (0666); the kernel says who
+   connects (SO_PEERCRED): root = admin; members of group "pialite" (read
+   fresh from /etc/group) and set-users ids = user; others refused.
+   Updates. check-update (any user) reads GitHub's latest release;
+   apply-update (admin) downloads the asset for this install's kind into the
+   admin-only data folder, verifies SHA256SUMS against its ed25519 signature
+   (public key compiled in from keys/release-signing.pub) and the file
+   against SHA256SUMS, then installs (MSI from a copy of the guard outside
+   the install folder, after the tray has closed; dpkg / rpm / install.sh).
+   Unsigned releases are only announced. Hosts: github.com,
+   api.github.com, *.githubusercontent.com; https only; bounded sizes.

@@ -1,0 +1,43 @@
+[package]
+name = "pialite-guard"
+version = "0.9.0"
+edition = "2021"
+description = "PIA Lite guard service: kill switch, encrypted DNS (DoH) proxy, hotel Wi-Fi login, setup and updates"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/NicholasBly/PIALite"
+
+[dependencies]
+pialite-common = { path = "../pialite-common" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# release signatures (ed25519) and checksums for updates - already used by rustls
+ring = "0.17"
+webpki-roots = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Rpc",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Security_Authorization",
+] }
+
+[dev-dependencies]
+rcgen = "0.14"
+
+[build-dependencies]
+# Windows: version info + icon in the .exe (the MSI compares file versions)
+winresource = "0.1"

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PIA Lite
+GenericName=VPN tray
+Comment=Lightweight tray for Private Internet Access
+Exec=pialite-tray
+Icon=pialite
+Terminal=false
+Categories=Network;
+Keywords=VPN;PIA;DNS;kill switch;
+StartupNotify=false

@@ -1,0 +1,305 @@
+{
+  "about": "Hotel recovery record cases (including duplicate / case-colliding / escaped field names, review V60-11). pialite-guard (config.rs test recovery_fixtures_agree) and the uninstaller's PowerShell reader (PiaLite-Common.ps1, checked by Phase5-Tests.ps1 quick checks) must both give 'expect'. record/guard = the exact text of hotel-recovery.json / guard.json, null = file missing. Expect: none | restore:<value> | unknown (unknown = the uninstaller asks you to check PIA yourself; the guard assumes 'on').",
+  "cases": [
+    {
+      "name": "valid, was on",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\",\"hotel_active\":true,\"hotel_saved_killswitch\":\"on\"}",
+      "expect": "restore:on"
+    },
+    {
+      "name": "valid, was auto",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"auto\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "restore:auto"
+    },
+    {
+      "name": "valid, was off",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"off\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "restore:off"
+    },
+    {
+      "name": "v0.5 record without version",
+      "record": "{\"hotel\":2,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "restore:on"
+    },
+    {
+      "name": "record valid, guard.json missing",
+      "record": "{\"version\":1,\"hotel\":1,\"saved_killswitch\":\"on\"}",
+      "guard": null,
+      "expect": "restore:on"
+    },
+    {
+      "name": "record valid, guard.json damaged",
+      "record": "{\"version\":1,\"hotel\":1,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":",
+      "expect": "restore:on"
+    },
+    {
+      "name": "unknown version",
+      "record": "{\"version\":2,\"hotel\":3,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "version null",
+      "record": "{\"version\":null,\"hotel\":3,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "version as text",
+      "record": "{\"version\":\"1\",\"hotel\":3,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "invalid kill switch value",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"bogus\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "empty kill switch value",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "kill switch null",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":null}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "kill switch missing",
+      "record": "{\"version\":1,\"hotel\":3}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "kill switch upper case",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"ON\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "kill switch as number",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":1}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "hotel zero",
+      "record": "{\"version\":1,\"hotel\":0,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "hotel negative",
+      "record": "{\"version\":1,\"hotel\":-1,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "hotel as text",
+      "record": "{\"version\":1,\"hotel\":\"3\",\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "hotel fraction",
+      "record": "{\"version\":1,\"hotel\":1.5,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "hotel too big",
+      "record": "{\"version\":1,\"hotel\":9007199254740992,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "hotel missing",
+      "record": "{\"version\":1,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "extra field",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"on\",\"note\":\"x\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "field name in other case",
+      "record": "{\"version\":1,\"hotel\":3,\"Saved_Killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "corrupt JSON",
+      "record": "{\"version\":1,\"hot",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "empty file",
+      "record": "",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "JSON array",
+      "record": "[]",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "JSON null",
+      "record": "null",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "JSON text",
+      "record": "\"on\"",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "record and guard.json disagree",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\",\"hotel_active\":true,\"hotel_saved_killswitch\":\"auto\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "record, guard.json marker already cleared",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\",\"hotel_active\":false,\"hotel_saved_killswitch\":\"\"}",
+      "expect": "restore:on"
+    },
+    {
+      "name": "no record, marker says on",
+      "record": null,
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\",\"hotel_active\":true,\"hotel_saved_killswitch\":\"on\"}",
+      "expect": "restore:on"
+    },
+    {
+      "name": "no record, marker says auto",
+      "record": null,
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\",\"hotel_active\":true,\"hotel_saved_killswitch\":\"auto\"}",
+      "expect": "restore:auto"
+    },
+    {
+      "name": "no record, marker with invalid value",
+      "record": null,
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\",\"hotel_active\":true,\"hotel_saved_killswitch\":\"bogus\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "no record, marker with empty value",
+      "record": null,
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\",\"hotel_active\":true,\"hotel_saved_killswitch\":\"\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "no record, marker as text",
+      "record": null,
+      "guard": "{\"mode\":\"startup\",\"hotel_active\":\"true\",\"hotel_saved_killswitch\":\"on\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "no record, saved value as number",
+      "record": null,
+      "guard": "{\"mode\":\"startup\",\"hotel_active\":true,\"hotel_saved_killswitch\":1}",
+      "expect": "unknown"
+    },
+    {
+      "name": "no record, no hotel login",
+      "record": null,
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\",\"hotel_active\":false,\"hotel_saved_killswitch\":\"\"}",
+      "expect": "none"
+    },
+    {
+      "name": "no record, older guard.json without hotel fields",
+      "record": null,
+      "guard": "{\"mode\":\"startup\",\"profile_id\":\"abc123\"}",
+      "expect": "none"
+    },
+    {
+      "name": "no record, guard.json missing",
+      "record": null,
+      "guard": null,
+      "expect": "unknown"
+    },
+    {
+      "name": "no record, guard.json damaged",
+      "record": null,
+      "guard": "{\"mode\":\"st",
+      "expect": "unknown"
+    },
+    {
+      "name": "no record, guard.json is an array",
+      "record": null,
+      "guard": "[]",
+      "expect": "unknown"
+    },
+    {
+      "name": "duplicate field",
+      "record": "{\"version\":1,\"hotel\":3,\"hotel\":4,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "duplicate kill switch field",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"auto\",\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "same field in other capitals",
+      "record": "{\"version\":1,\"hotel\":3,\"Hotel\":3,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "escape codes in a field name",
+      "record": "{\"version\":1,\"hot\\u0065l\":3,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"mode\":\"startup\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "record too big",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"on\"}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    ",
+      "guard": "{\"mode\":\"startup\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "quote and colon inside a value",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"on\\\":x\"}",
+      "guard": "{\"mode\":\"startup\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "no record, hotel_active twice",
+      "record": null,
+      "guard": "{\"mode\":\"startup\",\"hotel_active\":false,\"hotel_active\":true,\"hotel_saved_killswitch\":\"on\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "no record, hotel_active in other capitals",
+      "record": null,
+      "guard": "{\"mode\":\"startup\",\"hotel_active\":true,\"Hotel_Active\":false,\"hotel_saved_killswitch\":\"on\"}",
+      "expect": "unknown"
+    },
+    {
+      "name": "record valid, guard.json has a duplicate",
+      "record": "{\"version\":1,\"hotel\":3,\"saved_killswitch\":\"on\"}",
+      "guard": "{\"hotel_active\":true,\"hotel_active\":true}",
+      "expect": "restore:on"
+    }
+  ]
+}
