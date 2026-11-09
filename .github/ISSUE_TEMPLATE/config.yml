@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/NicholasBly/PIALite/security/advisories/new
+    about: Please report security problems privately.
+  - name: Problem with PIA itself
+    url: https://helpdesk.privateinternetaccess.com/
+    about: Account, servers or PIA's own app - PIA's support can help.

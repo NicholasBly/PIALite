@@ -1,0 +1,230 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PIA Lite - Windows installer (WiX Toolset v5).
+
+  The MSI copies the programs and lets you pick the features; everything
+  else (guard service, settings, PIA's DNS setting, sign-in tasks) is done by
+  `pialite-guard setup` - the same code the Linux packages run - so all
+  installers install exactly the features chosen. Uninstall runs
+  `pialite-guard teardown` first (block rules removed and checked, PIA put
+  back), before any file is removed.
+
+  Build (see .github/workflows/release.yml):
+    wix build packaging\windows\PIALite.wxs -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
+              -d Version=0.9.0 -d Bin=target\release -d Assets=assets -d Pkg=packaging\windows -o PIALite.msi
+
+  Silent install (every property optional):
+    msiexec /i PIALite-0.9.0-windows-x64.msi /qn DNS_PROVIDER=quad9 BLOCK_MODE=startup
+            ADDLOCAL=ALL   (or e.g. ADDLOCAL=Main,Guard,Dns REMOVE=Hotel,HidePia)
+    DNS_PROVIDER: quad9 | cloudflare | adguard | google | nextdns (+ NEXTDNS_ID=abc123)
+    BLOCK_MODE:   off | startup | always
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="PIA Lite"
+           Manufacturer="PIA Lite project"
+           Version="$(var.Version)"
+           UpgradeCode="2D36EA95-66AA-4937-86EA-77D14187B39F"
+           Scope="perMachine"
+           Compressed="yes"
+           InstallerVersion="500">
+
+    <SummaryInformation Description="PIA Lite - lightweight tray for Private Internet Access" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of PIA Lite is already installed." Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="pialite.ico" SourceFile="$(var.Assets)\pialite.ico" />
+    <Property Id="ARPPRODUCTICON" Value="pialite.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/NicholasBly/PIALite" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/NicholasBly/PIALite/issues" />
+    <Property Id="ARPCOMMENTS" Value="Not affiliated with Private Internet Access." />
+
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.Pkg)\license.rtf" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.Pkg)\banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.Pkg)\dialog.bmp" />
+
+    <!-- PIA itself must be there (PIA Lite talks to it through piactl) -->
+    <Property Id="PIACTL">
+      <DirectorySearch Id="PiaDir" Path="[ProgramFiles64Folder]Private Internet Access" Depth="0">
+        <FileSearch Name="piactl.exe" />
+      </DirectorySearch>
+    </Property>
+    <Launch Condition="Installed OR PIACTL" Message="Private Internet Access (PIA) is not installed. Install PIA from privateinternetaccess.com first - PIA Lite is a lighter window for it." />
+
+    <!-- choices from the "Encrypted DNS and kill switch" page -->
+    <Property Id="DNS_PROVIDER" Secure="yes" />
+    <Property Id="NEXTDNS_ID" Secure="yes" />
+    <Property Id="BLOCK_MODE" Secure="yes" />
+    <!-- first install: defaults; upgrade / change: "keep" = setup keeps what is set -->
+    <SetProperty Action="SetDnsNew" Id="DNS_PROVIDER" Value="quad9" Before="CostFinalize" Sequence="first"
+                 Condition="NOT DNS_PROVIDER AND NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+    <SetProperty Action="SetDnsKeep" Id="DNS_PROVIDER" Value="keep" Before="CostFinalize" Sequence="first"
+                 Condition="NOT DNS_PROVIDER AND (Installed OR WIX_UPGRADE_DETECTED)" />
+    <SetProperty Action="SetModeNew" Id="BLOCK_MODE" Value="startup" Before="CostFinalize" Sequence="first"
+                 Condition="NOT BLOCK_MODE AND NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+    <SetProperty Action="SetModeKeep" Id="BLOCK_MODE" Value="keep" Before="CostFinalize" Sequence="first"
+                 Condition="NOT BLOCK_MODE AND (Installed OR WIX_UPGRADE_DETECTED)" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="PiaLite" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="MenuFolder" Name="PIA Lite" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Programs" Directory="INSTALLFOLDER">
+      <Component Id="TrayExe">
+        <File Id="TrayExe" Source="$(var.Bin)\pialite-tray.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="GuardExe">
+        <File Id="GuardExe" Source="$(var.Bin)\pialite-guard.exe" KeyPath="yes" />
+        <!-- the guard service (made by setup) is stopped before its program is replaced -->
+        <ServiceControl Id="StopGuard" Name="PiaLiteGuard" Stop="both" Wait="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="MenuShortcuts" Directory="MenuFolder" Guid="11753345-84EB-4126-A987-3090C92F08F2">
+      <Shortcut Id="TrayShortcut" Name="PIA Lite" Description="Lightweight tray for Private Internet Access"
+                Target="[#TrayExe]" WorkingDirectory="INSTALLFOLDER" Icon="pialite.ico" />
+      <Shortcut Id="UnlockShortcut" Name="PIA Lite - Unlock Internet" Description="Emergency: turn PIA Lite's internet block off (asks for admin)"
+                Target="[#GuardExe]" Arguments="unlock --pause" WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
+      <RegistryValue Root="HKMU" Key="Software\PIA Lite" Name="Shortcuts" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!-- one marker per optional feature (features need a component) -->
+    <Component Id="MarkGuard" Directory="INSTALLFOLDER" Guid="18FDD273-358B-4C74-94B5-4262012317C7">
+      <RegistryValue Root="HKLM" Key="Software\PIA Lite\Features" Name="guard" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+    <Component Id="MarkDns" Directory="INSTALLFOLDER" Guid="0A52DD54-F141-43E2-84D7-685452571221">
+      <RegistryValue Root="HKLM" Key="Software\PIA Lite\Features" Name="dns" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+    <Component Id="MarkHotel" Directory="INSTALLFOLDER" Guid="8A763EF9-C759-4820-B1E6-E45DBA252B84">
+      <RegistryValue Root="HKLM" Key="Software\PIA Lite\Features" Name="hotel" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+    <Component Id="MarkAutostart" Directory="INSTALLFOLDER" Guid="2131E32C-AB88-4A2F-AFFD-79239165F99B">
+      <RegistryValue Root="HKLM" Key="Software\PIA Lite\Features" Name="autostart" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+    <Component Id="MarkHidePia" Directory="INSTALLFOLDER" Guid="43AD2ED7-F317-4419-BDC8-5EB8E1A6214C">
+      <RegistryValue Root="HKLM" Key="Software\PIA Lite\Features" Name="hidepia" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main" Title="PIA Lite tray" Level="1" AllowAbsent="no" AllowAdvertise="no" Display="expand"
+             ConfigurableDirectory="INSTALLFOLDER"
+             Description="The tray icon and panel: connect, disconnect, pick a region, see the status. Always installed.">
+      <ComponentGroupRef Id="Programs" />
+      <ComponentRef Id="MenuShortcuts" />
+      <Feature Id="Guard" Title="Network guard (kill switch)" Level="1" AllowAdvertise="no" Display="expand"
+               Description="A small background service: blocks the internet until the VPN connects (at startup, or always). Needed by the two options below.">
+        <ComponentRef Id="MarkGuard" />
+        <Feature Id="Dns" Title="Encrypted DNS" Level="1" AllowAdvertise="no"
+                 Description="Every lookup over HTTPS to the provider you pick on the next page (Quad9, Cloudflare, AdGuard, Google or NextDNS).">
+          <ComponentRef Id="MarkDns" />
+        </Feature>
+        <Feature Id="Hotel" Title="Hotel Wi-Fi login" Level="1" AllowAdvertise="no"
+                 Description="A button that turns the VPN off for a few minutes so you can log in to a hotel or airport Wi-Fi page.">
+          <ComponentRef Id="MarkHotel" />
+        </Feature>
+      </Feature>
+      <Feature Id="Autostart" Title="Start at sign-in" Level="1" AllowAdvertise="no"
+               Description="Start the PIA Lite tray when anyone signs in (each user can turn it off in the tray).">
+        <ComponentRef Id="MarkAutostart" />
+      </Feature>
+      <Feature Id="HidePia" Title="Don't start PIA's own window at sign-in" Level="1" AllowAdvertise="no"
+               Description="Saves about 160 MB of memory - PIA Lite replaces it. PIA's VPN service still runs. Put back on uninstall.">
+        <ComponentRef Id="MarkHidePia" />
+      </Feature>
+    </Feature>
+
+    <!-- what will be installed after this run, for setup's feature list -->
+    <SetProperty Action="SetFGuard" Id="F_GUARD" Value="guard," After="InstallInitialize" Sequence="execute"
+                 Condition="(&amp;Guard=3) OR ((!Guard=3) AND (&amp;Guard&lt;&gt;2))" />
+    <SetProperty Action="SetFDns" Id="F_DNS" Value="dns," After="SetFGuard" Sequence="execute"
+                 Condition="(&amp;Dns=3) OR ((!Dns=3) AND (&amp;Dns&lt;&gt;2))" />
+    <SetProperty Action="SetFHotel" Id="F_HOTEL" Value="hotel," After="SetFDns" Sequence="execute"
+                 Condition="(&amp;Hotel=3) OR ((!Hotel=3) AND (&amp;Hotel&lt;&gt;2))" />
+    <SetProperty Action="SetFAutostart" Id="F_AUTOSTART" Value="autostart," After="SetFHotel" Sequence="execute"
+                 Condition="(&amp;Autostart=3) OR ((!Autostart=3) AND (&amp;Autostart&lt;&gt;2))" />
+    <SetProperty Action="SetFHidePia" Id="F_HIDEPIA" Value="hidepia," After="SetFAutostart" Sequence="execute"
+                 Condition="(&amp;HidePia=3) OR ((!HidePia=3) AND (&amp;HidePia&lt;&gt;2))" />
+
+    <!-- setup / teardown run hidden; their output goes to the MSI log -->
+    <SetProperty Id="RunSetup" After="SetFHidePia" Sequence="execute"
+                 Value="&quot;[#GuardExe]&quot; setup --kind=msi --product-code=[ProductCode] --features=[F_GUARD][F_DNS][F_HOTEL][F_AUTOSTART][F_HIDEPIA]none --dns=[DNS_PROVIDER] --nextdns-id=[NEXTDNS_ID] --mode=[BLOCK_MODE] --user=[UserSID]" />
+    <CustomAction Id="RunSetup" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+
+    <SetProperty Id="RollbackSetup" After="SetFHidePia" Sequence="execute" Value="&quot;[#GuardExe]&quot; teardown" />
+    <CustomAction Id="RollbackSetup" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" Return="ignore" />
+
+    <SetProperty Id="RunTeardown" Before="RunTeardown" Sequence="execute" Value="&quot;[#GuardExe]&quot; teardown" />
+    <CustomAction Id="RunTeardown" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+
+    <InstallExecuteSequence>
+      <!-- removal (not an upgrade): undo everything while the programs are still there -->
+      <Custom Action="RunTeardown" Before="StopServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RollbackSetup" Before="RunSetup" Condition="NOT REMOVE~=&quot;ALL&quot; AND NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+      <Custom Action="RunSetup" After="InstallFiles" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+
+    <UI Id="PiaLiteUI">
+      <ui:WixUI Id="WixUI_FeatureTree" />
+      <UIRef Id="WixUI_ErrorProgressText" />
+
+      <!-- no license page: GPL software needs no agreement -->
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="CustomizeDlg" Order="10" Condition="NOT Installed" />
+      <Publish Dialog="CustomizeDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="10" Condition="NOT Installed" />
+      <!-- the DNS / kill switch page comes after the feature tree when the guard is chosen -->
+      <Publish Dialog="CustomizeDlg" Control="Next" Event="NewDialog" Value="PiaLiteOptionsDlg" Order="10"
+               Condition="(&amp;Guard=3) OR ((!Guard=3) AND (&amp;Guard&lt;&gt;2))" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="PiaLiteOptionsDlg" Order="10"
+               Condition="((&amp;Guard=3) OR ((!Guard=3) AND (&amp;Guard&lt;&gt;2))) AND (NOT Installed OR WixUI_InstallMode=&quot;Change&quot;)" />
+
+      <ComboBox Property="DNS_PROVIDER">
+        <ListItem Value="keep" Text="Keep the current provider" />
+        <ListItem Value="quad9" Text="Quad9 - non-profit, blocks known malware" />
+        <ListItem Value="cloudflare" Text="Cloudflare (1.1.1.1) - fast" />
+        <ListItem Value="adguard" Text="AdGuard - blocks ads and trackers" />
+        <ListItem Value="google" Text="Google Public DNS" />
+        <ListItem Value="nextdns" Text="NextDNS - your own profile (enter its ID below)" />
+      </ComboBox>
+      <RadioButtonGroup Property="BLOCK_MODE">
+        <RadioButton Value="startup" X="0" Y="0" Width="300" Height="14" Text="At startup, until the VPN connects (then PIA's own kill switch)" />
+        <RadioButton Value="always" X="0" Y="16" Width="300" Height="14" Text="Always, whenever the VPN is not connected" />
+        <RadioButton Value="off" X="0" Y="32" Width="300" Height="14" Text="Off (you can turn it on later from the tray)" />
+        <RadioButton Value="keep" X="0" Y="48" Width="300" Height="14" Text="Keep the current setting" />
+      </RadioButtonGroup>
+
+      <Dialog Id="PiaLiteOptionsDlg" Width="370" Height="270" Title="!(loc.CustomizeDlg_Title)">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.CustomizeDlgBannerBitmap)" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="230" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Encrypted DNS and kill switch" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="Pick where lookups go and when the internet is blocked." />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+
+        <Control Id="DnsLabel" Type="Text" X="20" Y="56" Width="330" Height="12" Text="Encrypted DNS provider (used if 'Encrypted DNS' is selected):" />
+        <Control Id="Provider" Type="ComboBox" X="20" Y="70" Width="330" Height="16" Property="DNS_PROVIDER" ComboList="yes" />
+        <Control Id="NextIdLabel" Type="Text" X="20" Y="94" Width="150" Height="12" Text="NextDNS profile ID (e.g. abc123):"
+                 ShowCondition="DNS_PROVIDER=&quot;nextdns&quot;" HideCondition="DNS_PROVIDER&lt;&gt;&quot;nextdns&quot;" />
+        <Control Id="NextId" Type="Edit" X="175" Y="92" Width="100" Height="16" Property="NEXTDNS_ID" Text="{12}"
+                 ShowCondition="DNS_PROVIDER=&quot;nextdns&quot;" HideCondition="DNS_PROVIDER&lt;&gt;&quot;nextdns&quot;" />
+
+        <Control Id="ModeLabel" Type="Text" X="20" Y="120" Width="330" Height="12" Text="Block the internet (kill switch):" />
+        <Control Id="Mode" Type="RadioButtonGroup" X="26" Y="134" Width="320" Height="64" Property="BLOCK_MODE" />
+        <Control Id="Hint" Type="Text" X="20" Y="202" Width="330" Height="24" NoPrefix="yes"
+                 Text="Stuck offline? Start menu &gt; PIA Lite &gt; Unlock Internet. You can change all of this later (Settings &gt; Apps &gt; PIA Lite &gt; Modify)." />
+
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="CustomizeDlg" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)"
+                 DisableCondition="DNS_PROVIDER=&quot;nextdns&quot; AND NOT NEXTDNS_ID"
+                 EnableCondition="DNS_PROVIDER&lt;&gt;&quot;nextdns&quot; OR NEXTDNS_ID">
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+    </UI>
+  </Package>
+</Wix>

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2b2e39"/>
+      <stop offset="1" stop-color="#1b1d24"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b3f4e"/>
+      <stop offset="1" stop-color="#262832"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="320" rx="24" fill="url(#bg)"/>
+  <g transform="translate(80,64) scale(0.75)">
+    <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#tile)"/>
+    <circle cx="128" cy="138" r="70" fill="none" stroke="#4cb649" stroke-width="22" stroke-linecap="round"
+            stroke-dasharray="342.1 97.7" transform="rotate(-50 128 138)"/>
+    <rect x="117" y="42" width="22" height="92" rx="11" fill="#4cb649"/>
+  </g>
+  <g font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif">
+    <text x="320" y="140" font-size="76" font-weight="700" fill="#ffffff">PIA Lite</text>
+    <text x="324" y="190" font-size="27" fill="#c9cdd8">A tiny tray app for Private Internet Access</text>
+    <text x="324" y="228" font-size="22" fill="#8a90a0">optional kill switch  ·  encrypted DNS (any provider)  ·  hotel Wi-Fi login</text>
+    <g transform="translate(324,252)" font-size="16" font-weight="600">
+      <rect width="104" height="30" rx="15" fill="#284c6e"/>
+      <text x="52" y="20" text-anchor="middle" fill="#ffffff">Windows</text>
+      <rect x="116" width="80" height="30" rx="15" fill="#3b5f2e"/>
+      <text x="156" y="20" text-anchor="middle" fill="#ffffff">Linux</text>
+      <rect x="208" width="150" height="30" rx="15" fill="#4a3f6e"/>
+      <text x="283" y="20" text-anchor="middle" fill="#ffffff">Rust · GPL-3.0</text>
+    </g>
+  </g>
+</svg>

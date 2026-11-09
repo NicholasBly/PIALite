@@ -1,0 +1,459 @@
+// PIA Lite - tray icon + popup panel.
+// The panel uses the CPU renderer (no GPU), so it can't get the stacked-pixel glitch.
+
+import { LineEdit, ListView, CheckBox, ComboBox, Button } from "std-widgets.slint";
+
+export struct RegionEntry {
+    id: string,
+    label: string,
+    current: bool,
+}
+
+// ---------------------------------------------------------------- tray icon + right-click menu
+export component Tray inherits SystemTrayIcon {
+    in property <string> status-line: "PIA Lite: starting...";
+    in property <bool> can-connect: false;
+    in property <bool> can-disconnect: false;
+    in property <string> auto-title: "Auto (fastest)";
+    in property <string> autostart-title: "Start with Windows";
+    in property <[RegionEntry]> regions-us;
+    in property <[RegionEntry]> regions-ca;
+    in property <[RegionEntry]> regions-streaming;
+    in property <[RegionEntry]> regions-other-a;
+    in property <[RegionEntry]> regions-other-b;
+    in property <string> guard-line: "Guard: checking...";
+    in property <bool> guard-available: false;
+    in property <string> block-off-title: "Off";
+    in property <string> block-startup-title: "At startup until VPN connects (then PIA's kill switch)";
+    in property <string> block-always-title: "Always when VPN is not connected (includes startup)";
+    in property <string> hotel-title: "Hotel Wi-Fi login (VPN off for a few minutes)";
+    // optional features (0.9): hidden when not installed
+    in property <bool> hotel-feature: true;
+    in property <bool> block-feature: true;
+    in property <bool> update-available: false;
+    in property <string> update-title: "Update available";
+    in property <string> features-title: "Features and DNS provider...";
+
+    callback show-panel();
+    callback do-connect();
+    callback do-disconnect();
+    callback pick-region(string);
+    callback open-pia();
+    callback toggle-autostart();
+    callback set-block-mode(string);
+    callback toggle-hotel();
+    callback do-update();
+    callback open-features();
+    callback quit();
+
+    // settable from Rust (the built-in icon/tooltip properties aren't exposed directly)
+    in property <image> status-icon;
+    in property <string> status-tooltip: "PIA Lite";
+    icon: root.status-icon;
+    tooltip: root.status-tooltip;
+    clicked => { root.show-panel(); }
+
+    Menu {
+        MenuItem { title: root.status-line; enabled: false; }
+        MenuItem { title: root.guard-line; enabled: false; }
+        MenuSeparator { }
+        MenuItem { title: "Connect"; enabled: root.can-connect; activated => { root.do-connect(); } }
+        MenuItem { title: "Disconnect"; enabled: root.can-disconnect; activated => { root.do-disconnect(); } }
+        Menu {
+            title: "Region";
+            MenuItem { title: root.auto-title; activated => { root.pick-region("auto"); } }
+            MenuSeparator { }
+            Menu {
+                title: "United States";
+                for r in root.regions-us: MenuItem { title: r.label; activated => { root.pick-region(r.id); } }
+            }
+            Menu {
+                title: "Canada";
+                for r in root.regions-ca: MenuItem { title: r.label; activated => { root.pick-region(r.id); } }
+            }
+            Menu {
+                title: "Streaming optimized";
+                for r in root.regions-streaming: MenuItem { title: r.label; activated => { root.pick-region(r.id); } }
+            }
+            Menu {
+                title: "Other countries (A-M)";
+                for r in root.regions-other-a: MenuItem { title: r.label; activated => { root.pick-region(r.id); } }
+            }
+            Menu {
+                title: "Other countries (N-Z)";
+                for r in root.regions-other-b: MenuItem { title: r.label; activated => { root.pick-region(r.id); } }
+            }
+        }
+        MenuSeparator { }
+        if root.hotel-feature: MenuItem { title: root.hotel-title; enabled: root.guard-available; activated => { root.toggle-hotel(); } }
+        if root.block-feature: Menu {
+            title: "Block internet";
+            enabled: root.guard-available;
+            MenuItem { title: root.block-off-title; activated => { root.set-block-mode("off"); } }
+            MenuItem { title: root.block-startup-title; activated => { root.set-block-mode("startup"); } }
+            MenuItem { title: root.block-always-title; activated => { root.set-block-mode("always"); } }
+        }
+        MenuSeparator { }
+        if root.update-available: MenuItem { title: root.update-title; activated => { root.do-update(); } }
+        MenuItem { title: "Show panel"; activated => { root.show-panel(); } }
+        MenuItem { title: "Open full PIA app (settings, split tunnel...)"; activated => { root.open-pia(); } }
+        MenuItem { title: root.features-title; activated => { root.open-features(); } }
+        MenuItem { title: root.autostart-title; activated => { root.toggle-autostart(); } }
+        MenuSeparator { }
+        MenuItem { title: "Quit tray (VPN keeps running)"; activated => { root.quit(); } }
+    }
+}
+
+// ---------------------------------------------------------------- popup panel (left-click)
+export component Popup inherits Window {
+    title: "PIA Lite";
+    no-frame: true;
+    always-on-top: true;
+    width: 320px;
+    height: root.update-text != "" ? 542px : 500px;
+    background: #2b2e39;
+    forward-focus: keys;
+
+    in property <string> header-text: "...";
+    in property <int> kind: 0;            // 0 unknown (grey), 1 connected (green), 2 busy (yellow), 3 disconnected (red)
+    in property <string> region-label: "-";
+    in property <string> vpn-ip: "-";
+    in property <string> hint-text: "";
+    in property <bool> busy: false;
+    in property <[RegionEntry]> region-list;
+    in-out property <bool> show-regions: false;
+    in property <string> guard-text: "";
+    in property <bool> guard-warn: false;
+    in property <string> hotel-label: "Hotel Wi-Fi login";
+    in property <bool> hotel-enabled: false;
+    in property <bool> hotel-feature: true;
+    in property <string> update-text: "";
+
+    callback toggle-connect();
+    callback pick-region(string);
+    callback filter-changed(string);
+    callback open-pia();
+    callback close-panel();
+    callback toggle-hotel();
+    callback do-update();
+
+    property <color> accent: root.kind == 1 ? #4cb649 : root.kind == 2 ? #e8a628 : root.kind == 3 ? #d9534f : #6b6f7a;
+    property <color> panel: #323644;
+    property <color> panel-hover: #3b3f4e;
+    property <color> muted: #8a90a0;
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                if (root.show-regions) { root.show-regions = false; } else { root.close-panel(); }
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            padding: 0;
+            spacing: 0;
+
+            // ---- header bar (status colour)
+            Rectangle {
+                height: 52px;
+                background: root.accent;
+                HorizontalLayout {
+                    padding-left: 44px;
+                    Text {
+                        text: root.header-text;
+                        color: white;
+                        font-size: 15px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    close-ta := TouchArea {
+                        width: 44px;
+                        mouse-cursor: pointer;
+                        clicked => { root.close-panel(); }
+                        Rectangle {
+                            background: close-ta.has-hover ? #00000033 : transparent;
+                            Text { text: "×"; color: white; font-size: 22px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+
+            // ---- main page
+            if !root.show-regions: VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    alignment: center;
+                    power := TouchArea {
+                        width: 130px;
+                        height: 130px;
+                        enabled: !root.busy;
+                        mouse-cursor: root.busy ? MouseCursor.default : MouseCursor.pointer;
+                        clicked => { root.toggle-connect(); }
+                        Rectangle {
+                            border-radius: self.width / 2;
+                            border-width: 10px;
+                            border-color: power.has-hover ? root.accent.brighter(0.25) : root.accent;
+                            background: #22252e;
+                            // power symbol: ring with a gap at the top + a bar
+                            Rectangle {
+                                x: (parent.width - 56px) / 2;
+                                y: (parent.height - 56px) / 2;
+                                width: 56px;
+                                height: 56px;
+                                border-radius: 28px;
+                                border-width: 6px;
+                                border-color: root.accent;
+                            }
+                            Rectangle {
+                                x: (parent.width - 22px) / 2;
+                                y: (parent.height - 56px) / 2 - 2px;
+                                width: 22px;
+                                height: 16px;
+                                background: #22252e;
+                            }
+                            Rectangle {
+                                x: (parent.width - 6px) / 2;
+                                y: (parent.height - 56px) / 2 - 8px;
+                                width: 6px;
+                                height: 34px;
+                                border-radius: 3px;
+                                background: root.accent;
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.hint-text;
+                    color: root.muted;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+
+                // region row (click to change)
+                region-ta := TouchArea {
+                    height: 58px;
+                    mouse-cursor: pointer;
+                    clicked => { root.show-regions = true; }
+                    Rectangle {
+                        border-radius: 6px;
+                        background: region-ta.has-hover ? root.panel-hover : root.panel;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                Text { text: "VPN SERVER"; color: root.muted; font-size: 10px; }
+                                Text { text: root.region-label; color: white; font-size: 15px; overflow: elide; }
+                            }
+                            Text { text: ">"; color: root.muted; font-size: 18px; horizontal-alignment: right; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                // VPN IP row
+                Rectangle {
+                    height: 50px;
+                    border-radius: 6px;
+                    background: root.panel;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            Text { text: "VPN IP"; color: root.muted; font-size: 10px; }
+                            Text { text: root.vpn-ip; color: white; font-size: 14px; }
+                        }
+                    }
+                }
+
+                // hotel Wi-Fi (captive portal) button
+                if root.hotel-feature: hotel-ta := TouchArea {
+                    height: 34px;
+                    enabled: root.hotel-enabled;
+                    mouse-cursor: root.hotel-enabled ? MouseCursor.pointer : MouseCursor.default;
+                    clicked => { root.toggle-hotel(); }
+                    Rectangle {
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #454a5c;
+                        background: hotel-ta.has-hover ? root.panel-hover : transparent;
+                        Text {
+                            text: root.hotel-label;
+                            color: root.hotel-enabled ? white : root.muted;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.guard-text;
+                    color: root.guard-warn ? #e8a628 : root.muted;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { }  // spacer
+
+                if root.update-text != "": update-ta := TouchArea {
+                    height: 30px;
+                    mouse-cursor: pointer;
+                    clicked => { root.do-update(); }
+                    Rectangle {
+                        border-radius: 6px;
+                        background: update-ta.has-hover ? #2f5f8a : #284c6e;
+                        Text { text: root.update-text; color: white; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                pia-ta := TouchArea {
+                    height: 22px;
+                    mouse-cursor: pointer;
+                    clicked => { root.open-pia(); }
+                    Text {
+                        text: "Open full PIA app (settings, split tunnel...)";
+                        color: pia-ta.has-hover ? white : root.muted;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // ---- region picker page
+            if root.show-regions: VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    back-ta := TouchArea {
+                        width: 34px;
+                        mouse-cursor: pointer;
+                        clicked => { root.show-regions = false; }
+                        Rectangle {
+                            border-radius: 4px;
+                            background: back-ta.has-hover ? root.panel-hover : root.panel;
+                            Text { text: "<"; color: white; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                    LineEdit {
+                        placeholder-text: "Search regions";
+                        edited(text) => { root.filter-changed(text); }
+                    }
+                }
+                ListView {
+                    for r in root.region-list: row-ta := TouchArea {
+                        height: 34px;
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.pick-region(r.id);
+                            root.show-regions = false;
+                        }
+                        Rectangle {
+                            background: row-ta.has-hover ? root.panel-hover : r.current ? #2f4a33 : transparent;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                Text { text: r.label; color: white; font-size: 13px; vertical-alignment: center; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- features window (choose / change what is installed)
+export component Features inherits Window {
+    title: "PIA Lite - Features";
+    width: 440px;
+    background: #2b2e39;
+
+    in-out property <bool> guard: true;
+    in-out property <bool> dns: true;
+    in-out property <bool> hotel: true;
+    in-out property <bool> autostart: true;
+    in-out property <int> provider: 0;      // index into `providers`
+    in-out property <string> nextdns-id: "";
+    in-out property <int> mode: 1;          // 0 off, 1 startup, 2 always
+    in property <string> status-text: "";
+    in property <bool> status-warn: false;
+    in property <bool> busy: false;
+    in property <string> apply-label: "Apply";
+    out property <[string]> providers: ["Quad9", "Cloudflare", "AdGuard", "Google", "NextDNS (your profile)"];
+
+    callback apply();
+    callback cancel();
+
+    property <color> muted: #8a90a0;
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 10px;
+
+        Text { text: "What should PIA Lite do on this computer?"; color: white; font-size: 15px; font-weight: 700; }
+        Text {
+            text: "The tray (connect, regions, status) is always included. The rest runs as a small background service.";
+            color: root.muted; font-size: 11px; wrap: word-wrap;
+        }
+
+        CheckBox { text: "Network guard - kill switch service"; checked <=> root.guard; enabled: !root.busy; }
+        HorizontalLayout {
+            padding-left: 26px;
+            spacing: 8px;
+            Text { text: "Block internet:"; color: root.guard ? white : root.muted; vertical-alignment: center; font-size: 12px; }
+            ComboBox {
+                model: ["Off", "At startup until the VPN connects", "Always when the VPN is down"];
+                current-index <=> root.mode;
+                enabled: root.guard && !root.busy;
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: 26px;
+            CheckBox { text: "Encrypted DNS (DNS over HTTPS)"; checked <=> root.dns; enabled: root.guard && !root.busy; }
+        }
+        HorizontalLayout {
+            padding-left: 52px;
+            spacing: 8px;
+            Text { text: "Provider:"; color: root.guard && root.dns ? white : root.muted; vertical-alignment: center; font-size: 12px; }
+            ComboBox { model: root.providers; current-index <=> root.provider; enabled: root.guard && root.dns && !root.busy; }
+        }
+        if root.provider == 4: HorizontalLayout {
+            padding-left: 52px;
+            spacing: 8px;
+            Text { text: "NextDNS profile ID:"; color: root.guard && root.dns ? white : root.muted; vertical-alignment: center; font-size: 12px; }
+            LineEdit { text <=> root.nextdns-id; placeholder-text: "e.g. abc123"; enabled: root.guard && root.dns && !root.busy; }
+        }
+
+        HorizontalLayout {
+            padding-left: 26px;
+            CheckBox { text: "Hotel Wi-Fi login button"; checked <=> root.hotel; enabled: root.guard && !root.busy; }
+        }
+
+        CheckBox { text: "Start PIA Lite when I sign in"; checked <=> root.autostart; enabled: !root.busy; }
+
+        Text {
+            text: root.status-text;
+            color: root.status-warn ? #e8a628 : root.muted;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            spacing: 10px;
+            Button { text: "Cancel"; enabled: !root.busy; clicked => { root.cancel(); } }
+            Button { text: root.apply-label; primary: true; enabled: !root.busy; clicked => { root.apply(); } }
+        }
+    }
+}

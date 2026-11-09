@@ -1,0 +1,17 @@
+[Unit]
+Description=PIA Lite: block rules before the network starts
+Documentation=https://github.com/NicholasBly/PIALite
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+ConditionPathExists=/var/lib/pialite/firewall.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'exec nft -f /var/lib/pialite/firewall.nft'
+
+[Install]
+WantedBy=sysinit.target

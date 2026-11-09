@@ -1,0 +1,46 @@
+name: Bug report
+description: Something doesn't work as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please remove personal details (user names, public IP, NextDNS profile ID) from anything you paste.
+        Security problems: please use the private report in the Security tab instead.
+  - type: input
+    id: version
+    attributes:
+      label: PIA Lite version
+      description: "`pialite-guard version`"
+      placeholder: "0.9.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: System
+      options: [Windows 11, Windows 10, Ubuntu / Debian / Mint, Fedora / RHEL, openSUSE, Arch, Other Linux]
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installed with
+      options: [MSI, Windows portable zip, .deb, .rpm, .tar.gz install.sh, tar.gz portable, built from source]
+  - type: input
+    id: pia
+    attributes:
+      label: PIA version and protocol
+      placeholder: "3.6.1, WireGuard"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: "`pialite-guard status` and the end of the guard log"
+      render: text
