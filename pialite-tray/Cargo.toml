@@ -42,6 +42,8 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 slint = { version = "1.18", default-features = false, features = ["backend-winit-x11", "backend-winit-wayland"] }
 libc = "0.2"
+# is the tray (StatusNotifierWatcher) there, and is our icon registered? (already used by Slint's tray)
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
 [build-dependencies]
 # Windows: version info + icon in the .exe (the MSI compares file versions)
