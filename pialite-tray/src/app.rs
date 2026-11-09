@@ -980,7 +980,7 @@ fn start_icon_check() {
             misses.set(n);
             if !winutil::taskbar_ready() {
                 if n == 1 || n.is_multiple_of(60) {
-                    log("no tray icon yet - waiting for Windows' taskbar");
+                    log("no tray icon yet - waiting for the taskbar / desktop tray");
                 }
                 return;
             }
@@ -1002,7 +1002,7 @@ fn wait_for_taskbar() {
     let waited = t0.elapsed();
     if waited >= Duration::from_millis(100) {
         log(&format!(
-            "waited {:.1} s for Windows' taskbar{}",
+            "waited {:.1} s for the taskbar / desktop tray{}",
             waited.as_secs_f32(),
             if winutil::taskbar_ready() { "" } else { " - still not there, adding the icon when it appears" }
         ));

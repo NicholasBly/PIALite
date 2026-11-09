@@ -549,11 +549,48 @@ mod imp {
         }
     }
 
-    pub fn taskbar_ready() -> bool {
-        true
+    // ------------------------------------------------------------ tray icon upkeep
+    //
+    // The tray icon is a StatusNotifierItem. If the desktop's tray (the
+    // StatusNotifierWatcher) isn't there yet when PIA Lite starts at sign-in,
+    // Slint's one try fails and never comes back - the same problem v0.6.1
+    // solved on Windows. These let the app wait for the tray and add the icon
+    // again; anything that can't be asked counts as "fine" (no rebuild loop).
+
+    const WATCHER: &str = "org.kde.StatusNotifierWatcher";
+
+    fn bus() -> Option<&'static zbus::blocking::Connection> {
+        static C: std::sync::OnceLock<Option<zbus::blocking::Connection>> = std::sync::OnceLock::new();
+        C.get_or_init(|| zbus::blocking::Connection::session().ok()).as_ref()
     }
+
+    /// Is the desktop's tray (StatusNotifierWatcher) there?
+    pub fn taskbar_ready() -> bool {
+        let Some(c) = bus() else { return true };
+        let (Ok(d), Ok(name)) = (zbus::blocking::fdo::DBusProxy::new(c), zbus::names::BusName::try_from(WATCHER)) else { return true };
+        d.name_has_owner(name).unwrap_or(true)
+    }
+
+    /// Is an icon of THIS process registered with the tray? (Each entry's bus
+    /// name is asked for its process id - works however the tray lists it.)
     pub fn tray_icon_alive() -> bool {
-        true
+        let Some(c) = bus() else { return true };
+        if !taskbar_ready() {
+            return false;
+        }
+        let items = zbus::blocking::proxy::Builder::<zbus::blocking::Proxy>::new(c)
+            .destination(WATCHER)
+            .and_then(|b| b.path("/StatusNotifierWatcher"))
+            .and_then(|b| b.interface(WATCHER))
+            .map(|b| b.cache_properties(zbus::proxy::CacheProperties::No))
+            .and_then(|b| b.build())
+            .and_then(|p| p.get_property::<Vec<String>>("RegisteredStatusNotifierItems"));
+        let (Ok(items), Ok(d)) = (items, zbus::blocking::fdo::DBusProxy::new(c)) else { return true };
+        let me = std::process::id();
+        items.iter().any(|item| {
+            let name = item.split('/').next().unwrap_or("");
+            zbus::names::BusName::try_from(name).ok().and_then(|n| d.get_connection_unix_process_id(n).ok()) == Some(me)
+        })
     }
 
     fn show_socket() -> PathBuf {

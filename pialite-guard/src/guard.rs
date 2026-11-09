@@ -1611,9 +1611,11 @@ mod tests {
 
     /// A stand-in for PIA: a shell script as piactl plus a settings file it
     /// rewrites, so the hotel paths run for real (review N-17: inject PIA).
+    #[cfg(unix)]
     struct FakePia {
         dir: PathBuf,
     }
+    #[cfg(unix)]
     impl FakePia {
         fn new(data: &Path) -> FakePia {
             let dir = data.join("fakepia");
@@ -1667,6 +1669,7 @@ esac
             false
         }
     }
+    #[cfg(unix)]
     impl Drop for FakePia {
         fn drop(&mut self) {
             std::env::remove_var("PIALITE_PIACTL");
@@ -1984,6 +1987,7 @@ esac
     /// Review V63-04: the reconnect after a hotel login waits its turn behind
     /// other PIA commands and then checks again: it doesn't connect when PIA
     /// connected meanwhile or the user pressed Disconnect - and otherwise does.
+    #[cfg(unix)] // the fake piactl is a shell script
     #[test]
     fn hotel_reconnect_waits_its_turn_and_checks_again() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -2174,6 +2178,7 @@ esac
     /// changes PIA's kill switch or connection while a reconnect is running,
     /// and if the turn doesn't come within the bound it says "busy" having
     /// changed nothing.
+    #[cfg(unix)] // the fake piactl is a shell script
     #[test]
     fn hotel_entry_waits_its_turn_at_pia_commands() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -2365,6 +2370,7 @@ esac
         let _ = std::fs::remove_dir_all(d);
     }
 
+    #[cfg(unix)] // the fake piactl is a shell script
     #[test]
     fn hotel_exit_reblocks_restores_then_reconnects() {
         // review N-02 / N-06, manual stop and timer, restore OK and failing
@@ -2443,6 +2449,7 @@ esac
         let _ = std::fs::remove_dir_all(d);
     }
 
+    #[cfg(unix)] // the fake piactl is a shell script
     #[test]
     fn late_timer_never_ends_a_newer_hotel_login() {
         // review V3-02: the timer's worker of login #1 runs only after login #2 started
@@ -2481,6 +2488,7 @@ esac
         let _ = std::fs::remove_dir_all(d);
     }
 
+    #[cfg(unix)] // the fake piactl is a shell script
     #[test]
     fn nothing_opens_during_restore_and_off_mode_blocks_until_restored() {
         // review V3-03 (Connected arrives mid-restore) and V3-10 (block off,
@@ -2574,6 +2582,7 @@ esac
         let _ = std::fs::remove_dir_all(d);
     }
 
+    #[cfg(unix)] // the fake piactl is a shell script
     #[test]
     fn a_due_timer_does_not_end_a_login_started_since() {
         // review V4-01, through the guard: #1 is due, #2 starts before the tick
@@ -2602,6 +2611,7 @@ esac
         let _ = std::fs::remove_dir_all(d);
     }
 
+    #[cfg(unix)] // the fake piactl is a shell script
     #[test]
     fn recovery_record_survives_a_stale_settings_backup() {
         // review V4-03: guard.json is lost during a hotel login; its .bak is
@@ -2620,21 +2630,24 @@ esac
         // restart: settings come from the stale .bak, the recovery record still says "on"
         let g = Guard::start_with(free_addr(), false);
         assert!(g.status().config_error.contains("last good copy"));
-        for _ in 0..100 {
-            if pia.killswitch() == "on" && config::load_recovery() == RecoveryState::None {
+        // the log line comes right after the record is cleared: wait for both
+        // (a slower machine once read the log in between)
+        let logged = || std::fs::read_to_string(d.join("guard.log")).unwrap_or_default().contains("back to how it was");
+        for _ in 0..200 {
+            if pia.killswitch() == "on" && config::load_recovery() == RecoveryState::None && logged() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(pia.killswitch(), "on", "the user's kill switch came back");
         assert_eq!(config::load_recovery(), RecoveryState::None);
-        let log = std::fs::read_to_string(d.join("guard.log")).unwrap_or_default();
-        assert!(log.contains("back to how it was"), "the restore was found outstanding at start");
+        assert!(logged(), "the restore was found outstanding at start");
         g.shutdown();
         drop(pia);
         let _ = std::fs::remove_dir_all(d);
     }
 
+    #[cfg(unix)] // the fake piactl is a shell script
     #[test]
     fn restore_reports_a_firewall_sync_failure() {
         // review V4-06: PIA's kill switch is back, but the guard's rules can't

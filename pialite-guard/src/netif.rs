@@ -317,7 +317,7 @@ pub fn route_index(_ip: std::net::Ipv4Addr) -> Option<u32> {
     *TEST_ROUTE.lock().unwrap()
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 pub fn set_test_route(v: Option<u32>) {
     *TEST_ROUTE.lock().unwrap() = v;
 }
@@ -337,7 +337,7 @@ pub fn snapshot() -> Option<Snapshot> {
 }
 
 /// Tests: PIA's adapters as given (plus Wi-Fi up); None = the look fails.
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 pub fn set_test_adapters(v: Option<Vec<Adapter>>) {
     *TEST_NET.lock().unwrap() = match v {
         None => TestNet::Fail,
@@ -345,12 +345,12 @@ pub fn set_test_adapters(v: Option<Vec<Adapter>>) {
     };
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 pub fn set_test_snapshot(v: Snapshot) {
     *TEST_NET.lock().unwrap() = TestNet::Set(v);
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 pub fn reset_test_net() {
     *TEST_NET.lock().unwrap() = TestNet::Default;
     *TEST_ROUTE.lock().unwrap() = Some(7);
