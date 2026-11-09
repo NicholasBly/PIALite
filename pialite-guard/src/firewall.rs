@@ -184,7 +184,7 @@ pub fn is_own_allow_all(id: u64, owned: &[u64], in_our_sublayer: bool, weight: O
 
 /// Ids of the allow-all filters this guard currently holds (added by
 /// open_all, forgotten when that value is dropped).
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(any(test, not(any(windows, target_os = "linux"))), allow(dead_code))]
 pub static OWN_ALLOW_ALL: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
 /// Same rule apart from its position (index).
@@ -533,6 +533,7 @@ mod stub {
     /// Same key, same number of conditions, different value (e.g. a program
     /// swapped or a network range widened) - review V3-05.
     #[cfg(test)]
+    #[cfg_attr(windows, allow(dead_code))] // used by Unix-only tests
     pub fn tamper_value() -> bool {
         let mut s = S.lock().unwrap();
         for f in s.persistent.iter_mut() {
@@ -564,6 +565,7 @@ mod stub {
         (s.persistent.clone(), s.boot.clone())
     }
     #[cfg(test)]
+    #[cfg_attr(windows, allow(dead_code))] // used by Unix-only tests
     pub fn fail_next_uninstall() {
         S.lock().unwrap().fail_next_uninstall = true;
     }

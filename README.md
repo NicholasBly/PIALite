@@ -114,7 +114,7 @@ Whatever you pick is written to an install record, so **updates install the same
 
 | Provider | Choose it for | Server |
 |---|---|---|
-| **Quad9** | privacy-focused non-profit, blocks known malware domains | `dns.quad9.net` |
+| **Quad9** | privacy-focused non-profit, blocks known malware domains | `dns.quad9.net` (DNS over TLS - Quad9 ended DNS over HTTPS/1.1 in Dec 2025) |
 | **Cloudflare** | speed | `cloudflare-dns.com` |
 | **AdGuard** | blocks ads and trackers | `dns.adguard-dns.com` |
 | **Google** | Google Public DNS | `dns.google` |
@@ -122,7 +122,7 @@ Whatever you pick is written to an install record, so **updates install the same
 | **Custom** | any DNS-over-HTTPS server (command line: `set-dns custom https://host/dns-query IP[,IP]`) | yours |
 
 The guard connects to the provider by IP address (no plain-DNS lookup ever happens to find it) and checks its TLS
-certificate. Switch any time: `pialite-guard set-dns cloudflare` (admin), or the features window.
+certificate. Lookups go over HTTPS (DoH), or over TLS on port 853 (DoT) for Quad9. Switch any time: `pialite-guard set-dns cloudflare` (admin), or the features window.
 
 - **Windows:** PIA's DNS setting is pointed at the guard (`127.0.0.1`); your previous setting is saved and put back
   on uninstall. If the NextDNS Windows app is installed, it is paused (not removed) so two DNS programs don't fight.

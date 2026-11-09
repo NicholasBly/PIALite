@@ -113,6 +113,9 @@ pub struct Doh {
     epoch: AtomicU64,
     /// A warm-up is running (one at a time).
     warming: AtomicBool,
+    /// DNS over TLS (RFC 7858: 2-byte length + message on a TLS stream to
+    /// port 853) instead of HTTPS - for providers without HTTP/1.1 DoH.
+    dot: bool,
 }
 
 /// Why one server didn't work.
@@ -137,13 +140,17 @@ fn cert_error(e: &std::io::Error) -> bool {
 }
 
 pub fn tls_config(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
+    tls_config_alpn(roots, &[b"http/1.1"])
+}
+
+fn tls_config_alpn(roots: rustls::RootCertStore, alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("TLS versions")
         .with_root_certificates(roots)
         .with_no_client_auth();
-    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     Arc::new(cfg)
 }
 
@@ -207,7 +214,14 @@ impl Doh {
             cert_logged: Mutex::new(None),
             epoch: AtomicU64::new(0),
             warming: AtomicBool::new(false),
+            dot: false,
         })
+    }
+
+    /// Speak DNS over TLS on these addresses instead of HTTPS.
+    pub fn with_dot(mut self, on: bool) -> Self {
+        self.dot = on;
+        self
     }
 
     /// Keep a connection opened ahead of time - only if it belongs to the
@@ -228,11 +242,14 @@ impl Doh {
         self
     }
 
-    /// From the config's bootstrap IP list (port 443).
+    /// From the config's bootstrap IP list (port 443, or 853 for DNS over TLS).
     pub fn from_config(cfg: &crate::config::Config) -> Result<Self, String> {
+        let dot = cfg.dot();
+        let port = if dot { 853 } else { 443 };
         let addrs =
-            cfg.doh_bootstrap.iter().filter_map(|ip| ip.parse::<std::net::IpAddr>().ok()).map(|ip| SocketAddr::new(ip, 443)).collect();
-        Doh::new(tls_config(public_roots()), &cfg.doh_host, &cfg.doh_path(), addrs)
+            cfg.doh_bootstrap.iter().filter_map(|ip| ip.parse::<std::net::IpAddr>().ok()).map(|ip| SocketAddr::new(ip, port)).collect();
+        let tls = if dot { tls_config_alpn(public_roots(), &[b"dot"]) } else { tls_config(public_roots()) };
+        Ok(Doh::new(tls, &cfg.doh_host, &cfg.doh_path(), addrs)?.with_dot(dot))
     }
 
     /// A new, fully verified TLS connection to one address, all of it before
@@ -278,17 +295,37 @@ impl Doh {
 
     /// Send the query and accept only a real DNS answer to it.
     fn exchange(&self, conn: &mut Conn, query: &[u8]) -> Result<http::Reply, String> {
-        let reply = http::post_dns(conn, &self.host, &self.path, query)?;
+        let reply = if self.dot { dot_exchange(conn, query)? } else { http::post_dns(conn, &self.host, &self.path, query)? };
         validate(&reply, query)?;
         Ok(reply)
     }
+}
+
+/// One DNS-over-TLS round trip: 2-byte length + query, 2-byte length + answer.
+fn dot_exchange(conn: &mut Conn, query: &[u8]) -> Result<http::Reply, String> {
+    use std::io::{Read, Write};
+    let len = u16::try_from(query.len()).map_err(|_| "query too long")?;
+    let mut msg = Vec::with_capacity(query.len() + 2);
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(query);
+    conn.write_all(&msg).and_then(|_| conn.flush()).map_err(|e| format!("send: {e}"))?;
+    let mut n = [0u8; 2];
+    conn.read_exact(&mut n).map_err(|e| format!("no answer: {e}"))?;
+    let n = u16::from_be_bytes(n) as usize;
+    if n < 12 {
+        return Err("DoT answer too short".into());
+    }
+    let mut body = vec![0u8; n];
+    conn.read_exact(&mut body).map_err(|e| format!("answer cut off: {e}"))?;
+    // same checks as DoH answers (validate), so pretend the HTTP parts
+    Ok(http::Reply { status: 200, location: String::new(), body, content_type: "application/dns-message".into(), keep_alive: true })
 }
 
 /// RFC 8484 answer checks (audit P2-14): right content type, ID 0 as sent,
 /// marked as a response, and answering the same question.
 fn validate(reply: &http::Reply, query: &[u8]) -> Result<(), String> {
     if !reply.content_type.starts_with("application/dns-message") {
-        return Err(format!("NextDNS sent '{}' instead of a DNS answer", reply.content_type));
+        return Err(format!("the DNS provider sent '{}' instead of a DNS answer", reply.content_type));
     }
     if dns::id(&reply.body) != Some(0) {
         return Err("DoH answer has the wrong ID".into());
@@ -301,7 +338,7 @@ impl Doh {
         let mut last = self.cert_logged.lock().unwrap();
         if last.is_none_or(|t| t.elapsed() >= CERT_LOG_EVERY) {
             *last = Some(Instant::now());
-            crate::config::log(&format!("WARNING: NextDNS server {e} - possible interception, trying the other address"));
+            crate::config::log(&format!("WARNING: DNS server {e} - possible interception, trying the other address"));
         }
     }
 
@@ -406,6 +443,77 @@ pub mod tests {
     /// HTTP 503 really reaches HTTP - not a certificate failure).
     pub fn fake_server_with(close_after_each: bool, bad: &'static str) -> (SocketAddr, Arc<rustls::ClientConfig>, Arc<AtomicU32>) {
         serve(close_after_each, bad, false)
+    }
+
+    /// A fake DNS-over-TLS server (shared certificate): echoes each query as
+    /// an answer. `bad` = "id": a non-zero ID; "short": a 2-byte answer.
+    pub fn fake_dot_server(bad: &'static str) -> SocketAddr {
+        let (cert, key) = shared_cert().clone();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_cfg = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![rustls::pki_types::CertificateDer::from(cert)], rustls::pki_types::PrivateKeyDer::Pkcs8(key.into()))
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for tcp in listener.incoming().flatten() {
+                let cfg = server_cfg.clone();
+                std::thread::spawn(move || {
+                    let mut s = rustls::StreamOwned::new(rustls::ServerConnection::new(cfg).unwrap(), tcp);
+                    loop {
+                        let mut n = [0u8; 2];
+                        if s.read_exact(&mut n).is_err() {
+                            return;
+                        }
+                        let mut q = vec![0u8; u16::from_be_bytes(n) as usize];
+                        if s.read_exact(&mut q).is_err() {
+                            return;
+                        }
+                        q[2] |= 0x80;
+                        if bad == "id" {
+                            q[1] = 7;
+                        }
+                        let a = if bad == "short" { vec![1, 2] } else { q };
+                        let mut out = (a.len() as u16).to_be_bytes().to_vec();
+                        out.extend_from_slice(&a);
+                        if s.write_all(&out).and_then(|_| s.flush()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn dns_over_tls() {
+        let (_, tls, _) = fake_server(false); // trusts the shared certificate
+        let d = Doh::new(tls.clone(), "dns.nextdns.io", "/unused", vec![fake_dot_server("")]).unwrap().with_dot(true);
+        let q = dns::build_query(0x1234, "example.com", 1).unwrap();
+        for _ in 0..3 {
+            // the second and third reuse the kept connection
+            let a = d.resolve(&q).unwrap();
+            assert_eq!(dns::id(&a), Some(0x1234), "the original ID is put back");
+            assert!(dns::check_response(&a, &q).is_ok());
+        }
+        let bad = Doh::new(tls.clone(), "dns.nextdns.io", "/unused", vec![fake_dot_server("id")]).unwrap().with_dot(true);
+        assert!(bad.resolve(&q).unwrap_err().contains("wrong ID"));
+        let short = Doh::new(tls, "dns.nextdns.io", "/unused", vec![fake_dot_server("short")]).unwrap().with_dot(true);
+        assert!(short.resolve(&q).unwrap_err().contains("too short"));
+        // the real setting: Quad9 speaks DoT on port 853
+        let mut c = crate::config::Config::default();
+        c.set_provider("quad9", None).unwrap();
+        let q9 = Doh::from_config(&c).unwrap();
+        assert!(q9.dot && q9.addrs.iter().all(|a| a.port() == 853));
+        c.set_provider("cloudflare", None).unwrap();
+        let cf = Doh::from_config(&c).unwrap();
+        assert!(!cf.dot && cf.addrs.iter().all(|a| a.port() == 443));
     }
 
     /// A server with its OWN certificate, which the shared config doesn't trust.
