@@ -872,7 +872,7 @@ fn test_dns(json: bool, canary: Option<&str>) -> Result<(), String> {
     } else {
         let yn = |b: bool| if b { "YES" } else { "NO" };
         println!("Lookups answered by the guard        : {}", yn(proxy.is_ok()));
-        println!("Encrypted (DoH) via {:<17}: {}", provider_name(&provider), yn(encrypted));
+        println!("Encrypted via {:<23}: {}", provider_name(&provider), yn(encrypted));
         println!(
             "The system's resolver uses the guard : {}",
             match os {

@@ -68,6 +68,9 @@ pub struct DnsPreset {
     pub host: &'static str,
     pub path: &'static str,
     pub bootstrap: &'static [&'static str],
+    /// DNS over TLS (port 853) instead of DNS over HTTPS: Quad9 ended DoH
+    /// over HTTP/1.1 in Dec 2025 (it answers "HTTP 505"), DoT still works.
+    pub dot: bool,
 }
 
 /// Checked against the providers' own pages, 2026-11 (Mullvad's public DNS
@@ -79,6 +82,7 @@ pub const DNS_PRESETS: &[DnsPreset] = &[
         host: "dns.nextdns.io",
         path: "",
         bootstrap: &["45.90.28.0", "45.90.30.0", "2a07:a8c0::", "2a07:a8c1::"],
+        dot: false,
     },
     DnsPreset {
         id: "cloudflare",
@@ -86,6 +90,7 @@ pub const DNS_PRESETS: &[DnsPreset] = &[
         host: "cloudflare-dns.com",
         path: "/dns-query",
         bootstrap: &["1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001"],
+        dot: false,
     },
     DnsPreset {
         id: "quad9",
@@ -93,6 +98,7 @@ pub const DNS_PRESETS: &[DnsPreset] = &[
         host: "dns.quad9.net",
         path: "/dns-query",
         bootstrap: &["9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9"],
+        dot: true,
     },
     DnsPreset {
         id: "adguard",
@@ -100,6 +106,7 @@ pub const DNS_PRESETS: &[DnsPreset] = &[
         host: "dns.adguard-dns.com",
         path: "/dns-query",
         bootstrap: &["94.140.14.14", "94.140.15.15", "2a10:50c0::ad1:ff", "2a10:50c0::ad2:ff"],
+        dot: false,
     },
     DnsPreset {
         id: "google",
@@ -107,6 +114,7 @@ pub const DNS_PRESETS: &[DnsPreset] = &[
         host: "dns.google",
         path: "/dns-query",
         bootstrap: &["8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844"],
+        dot: false,
     },
 ];
 
@@ -179,6 +187,11 @@ impl Config {
 
     /// URL path for DoH. NextDNS: /<profile>/<device>, only letters, digits
     /// and dashes; other presets: their path; custom: the path given.
+    /// DNS over TLS for this provider (see DnsPreset::dot)?
+    pub fn dot(&self) -> bool {
+        preset(self.provider()).is_some_and(|p| p.dot)
+    }
+
     pub fn doh_path(&self) -> String {
         match self.provider() {
             "nextdns" => {}

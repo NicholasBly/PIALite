@@ -12,7 +12,8 @@ PowerShell scripts; they went through ten rounds of independent review (see `doc
   optional; the tray alone works without any of them. Every installer runs the same `pialite-guard setup`,
   so all of them install exactly what was chosen, and updates keep it.
 - **Any encrypted DNS provider:** Quad9, Cloudflare, AdGuard, Google, NextDNS (your profile) or your own
-  DNS-over-HTTPS server. `pialite-guard set-dns` switches it.
+  DNS-over-HTTPS server. `pialite-guard set-dns` switches it. Quad9 is reached over DNS over TLS
+  (port 853), since Quad9 no longer answers DNS over HTTPS/1.1.
 - **Windows installer (MSI)** with a feature tree and a page for the DNS provider and kill switch mode;
   silent installs with `DNS_PROVIDER`, `NEXTDNS_ID`, `BLOCK_MODE`. Start-menu shortcuts for PIA Lite and
   *Unlock Internet*. Uninstall removes the block rules (checked) and puts PIA's DNS, kill switch and startup back.

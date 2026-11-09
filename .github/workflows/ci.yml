@@ -49,6 +49,14 @@ jobs:
           sudo pialite-guard status
           getent hosts example.com
           sudo pialite-guard test-dns
+      - name: Every built-in DNS provider answers (live)
+        run: |
+          for p in cloudflare adguard google quad9; do
+            echo "== $p"
+            sudo pialite-guard set-dns "$p"
+            sudo pialite-guard test-doh
+          done
+          getent hosts github.com
       - name: Remove the package (teardown) and check nothing is left
         if: always()
         run: |

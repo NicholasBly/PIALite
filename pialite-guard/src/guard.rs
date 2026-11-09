@@ -1557,7 +1557,9 @@ pub const BUSY: &str = "busy: another change is still running - try again in a m
 mod tests {
     use super::*;
     use crate::config::tests::{temp_data, ENV_LOCK};
+    #[cfg(unix)]
     use crate::config::RecoveryState;
+    #[cfg(unix)]
     use std::path::{Path, PathBuf};
 
     type Hook = Box<dyn FnOnce() + Send>;
