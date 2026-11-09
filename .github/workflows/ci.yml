@@ -122,6 +122,7 @@ jobs:
           .\target\release\pialite-guard.exe check-rules
           if ($LASTEXITCODE -ne 0) { throw "block rules left behind" }
           if (Test-Path "$env:ProgramFiles\PiaLite") { Get-ChildItem "$env:ProgramFiles\PiaLite"; throw "files left behind" }
+          if (Test-Path "$env:ProgramData\PiaLite") { Get-ChildItem "$env:ProgramData\PiaLite"; throw "data folder left behind" }
       - name: Installer logs
         if: always()
         uses: actions/upload-artifact@v4

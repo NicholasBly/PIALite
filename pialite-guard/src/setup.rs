@@ -796,7 +796,8 @@ pub fn teardown(keep_config: bool) -> Result<(), String> {
     if !keep_config {
         let dir = config::data_dir();
         match std::fs::remove_dir_all(&dir) {
-            Ok(()) => rep.ok(format!("deleted {}", dir.display())),
+            // printed only: logging would create the folder (and its log) again
+            Ok(()) => println!("  ok  deleted {}", dir.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => rep.warn(format!("could not delete {} ({e}) - delete it later", dir.display())),
         }

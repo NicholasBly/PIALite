@@ -52,18 +52,15 @@
     <Launch Condition="Installed OR PIACTL" Message="Private Internet Access (PIA) is not installed. Install PIA from privateinternetaccess.com first - PIA Lite is a lighter window for it." />
 
     <!-- choices from the "Encrypted DNS and kill switch" page -->
-    <Property Id="DNS_PROVIDER" Secure="yes" />
+    <!-- "keep" = setup keeps what is set (upgrades, Modify); a first install
+         turns "keep" into the defaults below -->
+    <Property Id="DNS_PROVIDER" Value="keep" Secure="yes" />
     <Property Id="NEXTDNS_ID" Secure="yes" />
-    <Property Id="BLOCK_MODE" Secure="yes" />
-    <!-- first install: defaults; upgrade / change: "keep" = setup keeps what is set -->
+    <Property Id="BLOCK_MODE" Value="keep" Secure="yes" />
     <SetProperty Action="SetDnsNew" Id="DNS_PROVIDER" Value="quad9" Before="CostFinalize" Sequence="first"
-                 Condition="NOT DNS_PROVIDER AND NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
-    <SetProperty Action="SetDnsKeep" Id="DNS_PROVIDER" Value="keep" Before="CostFinalize" Sequence="first"
-                 Condition="NOT DNS_PROVIDER AND (Installed OR WIX_UPGRADE_DETECTED)" />
+                 Condition="DNS_PROVIDER=&quot;keep&quot; AND NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
     <SetProperty Action="SetModeNew" Id="BLOCK_MODE" Value="startup" Before="CostFinalize" Sequence="first"
-                 Condition="NOT BLOCK_MODE AND NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
-    <SetProperty Action="SetModeKeep" Id="BLOCK_MODE" Value="keep" Before="CostFinalize" Sequence="first"
-                 Condition="NOT BLOCK_MODE AND (Installed OR WIX_UPGRADE_DETECTED)" />
+                 Condition="BLOCK_MODE=&quot;keep&quot; AND NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="PiaLite" />
@@ -89,7 +86,7 @@
       <Shortcut Id="UnlockShortcut" Name="PIA Lite - Unlock Internet" Description="Emergency: turn PIA Lite's internet block off (asks for admin)"
                 Target="[#GuardExe]" Arguments="unlock --pause" WorkingDirectory="INSTALLFOLDER" />
       <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
-      <RegistryValue Root="HKMU" Key="Software\PIA Lite" Name="Shortcuts" Type="integer" Value="1" KeyPath="yes" />
+      <RegistryValue Root="HKCU" Key="Software\PIA Lite" Name="Shortcuts" Type="integer" Value="1" KeyPath="yes" />
     </Component>
 
     <!-- one marker per optional feature (features need a component) -->
