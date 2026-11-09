@@ -17,7 +17,7 @@ use std::time::Duration;
 /// Optional parts, by the names installers use.
 pub const FEATURES: &[(&str, &str)] = &[
     ("guard", "Network guard: background service with the kill switch (block internet until the VPN connects)"),
-    ("dns", "Encrypted DNS: every lookup over HTTPS to the provider you pick (needs the guard)"),
+    ("dns", "Encrypted DNS: every lookup encrypted to the provider you pick (needs the guard)"),
     ("hotel", "Hotel Wi-Fi login: VPN off for a few minutes to get past a login page (needs the guard)"),
     ("autostart", "Start the PIA Lite tray when you sign in"),
     ("hidepia", "Windows: don't start PIA's own window at sign-in (saves ~160 MB; PIA Lite replaces it)"),

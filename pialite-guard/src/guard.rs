@@ -1705,10 +1705,13 @@ esac
         assert!(g.status().blocking);
 
         // someone flips our block-all into an allow-all under the same key -> put back (N-09)
+        // (the background check must not repair it before this test looks - seen on CI)
+        let tick = NoTick::new();
         firewall::tamper_action();
         assert!(firewall::verify(&g.fw.lock().unwrap().expected).is_err(), "same key, different action is noticed");
         g.sync_rules(false);
         assert!(firewall::verify(&g.fw.lock().unwrap().expected).is_ok());
+        drop(tick);
 
         // non-admin can't change trusted settings
         assert!(g.handle("set_users S-1-5-21-1-2-3-1001", false).unwrap_err().contains("administrator"));
