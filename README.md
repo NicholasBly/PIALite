@@ -269,7 +269,8 @@ sudo unshare --net target/release/pialite-guard selftest-firewall   # Linux: rea
 
 Packages: `packaging/linux/build-packages.sh <version>` (needs `dpkg-deb`, and `rpmbuild` for the .rpm) and
 `packaging/windows/build.ps1 -Version <version>` (needs the [WiX Toolset](https://wixtoolset.org) v5).
-Releases are built by GitHub Actions when a `v*` tag is pushed - see [.github/workflows](.github/workflows).
+Releases are built by GitHub Actions: a new version number on `main` builds, tests, signs, tags and publishes
+itself - see [.github/workflows](.github/workflows).
 The Windows release test kit is in [tests/windows](tests/windows) and [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md).
 
 ## Security

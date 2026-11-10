@@ -45,6 +45,7 @@ Guidelines that keep this project trustworthy:
 1. Update the version in the three `Cargo.toml` files and add a section to `CHANGELOG.md`.
 2. Run the Windows release test kit (`tests/windows/Run-Phase5.bat`) and the checklist in
    [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md).
-3. Tag and push: `git tag v0.9.1 && git push origin v0.9.1`. GitHub Actions builds, signs and publishes.
+3. Push the version bump to `main`. GitHub Actions sees a version without a release, builds and tests it,
+   signs `SHA256SUMS`, creates the tag `vX.Y.Z` and publishes the release. (Pushing a tag works too.)
 
 By contributing you agree that your contributions are licensed under the GPL-3.0-or-later.
