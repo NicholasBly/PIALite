@@ -19,6 +19,7 @@ $msi = "dist\PIALite-$Version-windows-x64.msi"
 wix build packaging\windows\PIALite.wxs -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext `
     -d "Version=$Version" -d "Bin=target\release" -d "Assets=assets" -d "Pkg=packaging\windows" -o $msi
 if ($LASTEXITCODE -ne 0) { throw "wix build failed ($LASTEXITCODE)" }
+Remove-Item -Force -ErrorAction SilentlyContinue "dist\*.wixpdb"   # WiX debug data, not for release
 Write-Host "built $msi"
 
 $p = 'dist\portable'
