@@ -1,32 +1,62 @@
 name: Release
 
-# Push a tag like v0.9.0 (matching the version in Cargo.toml): the Windows
-# and Linux files are built and tested, SHA256SUMS is signed (if the
-# RELEASE_SIGNING_KEY secret is set) and the GitHub release is published.
+# A new version on main publishes itself: when the version in Cargo.toml has
+# no GitHub release yet (or a tag vX.Y.Z is pushed), the Windows and Linux
+# files are built and tested, SHA256SUMS is signed (if the
+# RELEASE_SIGNING_KEY secret is set), and the release - with its tag - is
+# published. Pushes that don't change the version stop after one quick check.
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(grep -m1 '^version' pialite-guard/Cargo.toml | cut -d'"' -f2)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$v" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match Cargo.toml version $v"; exit 1
+          fi
+          if gh release view "v$v" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release v$v already exists - nothing to do"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release v$v doesn't exist yet - building it"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   windows:
+    needs: check
+    if: needs.check.outputs.release == 'true'
     runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Version matches the tag
-        shell: pwsh
-        run: |
-          $v = (Select-String -Path pialite-guard\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          if ("v$v" -ne "${{ github.ref_name }}") { throw "tag ${{ github.ref_name }} doesn't match Cargo.toml version $v" }
-          "VERSION=$v" | Out-File -Append $env:GITHUB_ENV
       - run: cargo test --workspace
       - run: cargo build --release
       - name: Firewall self-test (real WFP)
@@ -47,16 +77,15 @@ jobs:
           path: dist/*
 
   linux:
+    needs: check
+    if: needs.check.outputs.release == 'true'
     runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Version matches the tag
-        run: |
-          v=$(grep -m1 '^version' pialite-guard/Cargo.toml | cut -d'"' -f2)
-          [ "v$v" = "${{ github.ref_name }}" ] || { echo "tag ${{ github.ref_name }} doesn't match Cargo.toml version $v"; exit 1; }
-          echo "VERSION=$v" >> "$GITHUB_ENV"
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig1-dev nftables rpm iproute2
       - run: cargo test --workspace
       - run: cargo build --release
@@ -69,8 +98,10 @@ jobs:
           path: dist/*
 
   publish:
-    needs: [windows, linux]
+    needs: [check, windows, linux]
     runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -96,7 +127,7 @@ jobs:
           openssl pkeyutl -verify -pubin -keyform DER -inkey "$RUNNER_TEMP/pub.der" -rawin -in dist/SHA256SUMS -sigfile dist/SHA256SUMS.sig
       - name: Release notes from CHANGELOG.md
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          v="$VERSION"
           awk -v v="$v" '$0 ~ "^## \\[?"v"\\]?" {on=1; next} on && /^## / {exit} on {print}' CHANGELOG.md > notes.md
           {
             echo
@@ -115,4 +146,5 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "PIA Lite ${GITHUB_REF_NAME#v}" --notes-file notes.md --verify-tag
+        # creates the tag vX.Y.Z on this commit if it isn't there yet
+        run: gh release create "v$VERSION" dist/* --target "$GITHUB_SHA" --title "PIA Lite $VERSION" --notes-file notes.md
