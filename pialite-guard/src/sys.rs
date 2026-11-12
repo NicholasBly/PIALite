@@ -729,29 +729,34 @@ pub fn protect_data_dir() -> Result<PathBuf, String> {
 pub fn harden_data_files(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     const SECRET: [&str; 5] = ["guard.json", "guard.json.bak", "guard.json.broken", "hotel-recovery.json", "firewall.nft"];
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    for entry in entries {
+    let mut entries = vec![];
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
         let p = entry.path();
         let m = std::fs::symlink_metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        entries.push((p, entry.file_name(), m));
+    }
+    // links first, before anything is changed
+    for (p, _, m) in &entries {
         if m.file_type().is_symlink() {
             return Err(format!("{} is a link - PIA Lite never follows those; remove it and run setup again", p.display()));
         }
         if m.is_file() && m.nlink() > 1 {
             return Err(format!("{} has other names (hard links) - remove it and run setup again", p.display()));
         }
+    }
+    for (p, name, m) in &entries {
         if m.uid() != 0 || m.gid() != 0 {
-            std::os::unix::fs::lchown(&p, Some(0), Some(0)).map_err(|e| format!("{}: could not give it to root: {e}", p.display()))?;
+            std::os::unix::fs::lchown(p, Some(0), Some(0)).map_err(|e| format!("{}: could not give it to root: {e}", p.display()))?;
         }
         let mode = m.mode() & 0o7777;
-        let name = entry.file_name();
-        let want = if m.is_file() && SECRET.iter().any(|s| name == *s) {
+        let want = if m.is_file() && SECRET.iter().any(|s| name == s) {
             0o600
         } else {
             mode & !0o022 & !0o6000 // no write for others, no setuid/setgid
         };
         if mode != want {
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(want)).map_err(|e| format!("{}: {e}", p.display()))?;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(want)).map_err(|e| format!("{}: {e}", p.display()))?;
         }
     }
     Ok(())
