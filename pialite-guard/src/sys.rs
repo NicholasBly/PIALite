@@ -625,10 +625,7 @@ pub fn dns_conflicts(d: &DnsSetup) -> Vec<String> {
     let guard_up = d.port53.iter().any(|p| p.rsplit('|').next().unwrap_or("").to_lowercase().contains("pialite"));
     for p in d.port53.iter().filter(|_| !guard_up) {
         if port53_blocks(p, cfg!(windows)) {
-            w.push(format!(
-                "another program holds DNS port 53 ({}) - the guard's DNS proxy can't start while it does",
-                port53_text(p)
-            ));
+            w.push(format!("another program holds DNS port 53 ({}) - the guard's DNS proxy can't start while it does", port53_text(p)));
         }
     }
     for app in &d.dns_apps {
