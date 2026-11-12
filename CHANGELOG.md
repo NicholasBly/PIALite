@@ -2,6 +2,14 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.3] - 2026-11-12
+
+### Fixed
+- The DNS conflict check skips a network card bound to a Hyper-V virtual switch: it has no IP of its own, so
+  old DNS settings left on it aren't used (the vEthernet adapter is the one that counts).
+- `tools/dns-report.ps1`: section headings were missing (`H` is PowerShell's alias for Get-History), the TLS
+  certificate check failed in PowerShell 7, and programs on port 53 inside `svchost` are now named by service.
+
 ## [0.9.2] - 2026-11-11
 
 ### Fixed

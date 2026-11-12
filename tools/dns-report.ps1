@@ -10,6 +10,7 @@
 
   Run in PowerShell (no admin needed; some details need admin):
     powershell -ExecutionPolicy Bypass -File dns-report.ps1 -Server 192.168.1.2 -Name pi.hole
+    (or the same with pwsh, PowerShell 7)
 
   The report is saved on your Desktop as PIALite-DNS-report.txt. It contains
   your local network addresses and program names - no passwords, and your
@@ -22,19 +23,22 @@ param(
 $ErrorActionPreference = 'SilentlyContinue'
 $out = New-Object System.Collections.Generic.List[string]
 function W([string]$s = '') { $out.Add($s); Write-Host $s }
-function H([string]$s) { W ''; W ('== ' + $s) }
+# not 'H': that is PowerShell's alias for Get-History, which wins over a function
+function Section([string]$s) { W ''; W ('== ' + $s) }
 
 W ('PIA Lite DNS report - ' + (Get-Date -Format 'yyyy-MM-dd HH:mm'))
 $os = Get-CimInstance Win32_OperatingSystem
 W ('Windows: ' + $os.Caption + ' ' + $os.Version)
 
-H 'Network adapters (connected)'
+Section 'Network adapters (connected)'
 foreach ($a in (Get-NetAdapter | Where-Object { $_.Status -eq 'Up' })) {
     $g = $a.InterfaceGuid
     $n4 = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$g").NameServer
     $n6 = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$g").NameServer
     $used = (Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex | ForEach-Object { $_.ServerAddresses }) -join ', '
-    W ("- " + $a.Name + '  [' + $a.InterfaceDescription + ']  metric ' + (Get-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4).InterfaceMetric)
+    $ip = Get-NetIPInterface -InterfaceIndex $a.ifIndex
+    W ("- " + $a.Name + '  [' + $a.InterfaceDescription + ']  metric ' + ($ip | Where-Object { $_.AddressFamily -eq 'IPv4' }).InterfaceMetric)
+    if (-not $ip) { W '    (no IP of its own - bound to a virtual switch, so Windows does not use the DNS below)' }
     W ('    DNS in use     : ' + $used)
     W ('    typed in (v4)  : ' + $(if ($n4) { $n4 } else { '(none - automatic)' }))
     W ('    typed in (v6)  : ' + $(if ($n6) { $n6 } else { '(none - automatic)' }))
@@ -47,20 +51,26 @@ foreach ($a in (Get-NetAdapter | Where-Object { $_.Status -eq 'Up' })) {
     }
 }
 
-H "Windows' list of DNS-over-HTTPS servers"
+Section "Windows' list of DNS-over-HTTPS servers"
 Get-DnsClientDohServerAddress | ForEach-Object { W ('- ' + $_.ServerAddress + '  ' + $_.DohTemplate + '  fallback-to-plain=' + $_.AllowFallbackToUdp + '  auto=' + $_.AutoUpgrade) }
 
-H 'Name resolution policy (NRPT)'
+Section 'Name resolution policy (NRPT)'
 $nrpt = Get-DnsClientNrptPolicy
 if ($nrpt) { $nrpt | ForEach-Object { W ('- ' + ($_.Namespace -join ',') + ' -> ' + ($_.NameServers -join ',')) } } else { W '(none)' }
 
-H 'What holds DNS ports (53 = DNS, 853 = DNS over TLS)'
+Section 'What holds DNS ports (53 = DNS, 853 = DNS over TLS)'
 foreach ($port in 53, 853) {
-    Get-NetUDPEndpoint -LocalPort $port | ForEach-Object { W ("UDP " + $_.LocalAddress + ':' + $port + '  ' + (Get-Process -Id $_.OwningProcess).ProcessName) }
-    Get-NetTCPConnection -LocalPort $port -State Listen | ForEach-Object { W ("TCP " + $_.LocalAddress + ':' + $port + '  ' + (Get-Process -Id $_.OwningProcess).ProcessName) }
+    $eps = @(Get-NetUDPEndpoint -LocalPort $port | ForEach-Object { ,@('UDP', $_.LocalAddress, $_.OwningProcess) })
+    $eps += @(Get-NetTCPConnection -LocalPort $port -State Listen | ForEach-Object { ,@('TCP', $_.LocalAddress, $_.OwningProcess) })
+    foreach ($e in $eps) {
+        $pn = (Get-Process -Id $e[2]).ProcessName
+        # svchost hosts many Windows services - name the ones in that process
+        $svc = if ($pn -eq 'svchost') { '  services: ' + ((Get-CimInstance Win32_Service -Filter "ProcessId=$($e[2])" | ForEach-Object { $_.Name + ' (' + $_.DisplayName + ')' }) -join ', ') } else { '' }
+        W ($e[0] + ' ' + $e[1] + ':' + $port + '  ' + $pn + $svc)
+    }
 }
 
-H 'DNS programs (services and running programs)'
+Section 'DNS programs (services and running programs)'
 $pat = 'yogadns|nextdns|dnscrypt|acrylic|adguard|portmaster|technitium|dnsproxy|simplednscrypt|unbound|stubby|cloudflared|pialite'
 Get-Service | Where-Object { $_.Name -match $pat -or $_.DisplayName -match $pat } | ForEach-Object { W ('service: ' + $_.Name + ' / ' + $_.DisplayName + ' / ' + $_.Status + ' / ' + $_.StartType) }
 Get-Process | Where-Object { $_.ProcessName -match $pat } | ForEach-Object { W ('program: ' + $_.ProcessName + '  ' + $_.Path) }
@@ -68,7 +78,7 @@ Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM
     ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -match $pat } |
     ForEach-Object { W ('installed: ' + $_.DisplayName + ' ' + $_.DisplayVersion + '  in ' + $_.InstallLocation) }
 
-H 'YogaDNS settings (server lines only)'
+Section 'YogaDNS settings (server lines only)'
 $yoga = @("$env:ProgramData\YogaDNS", "$env:APPDATA\YogaDNS", "$env:LOCALAPPDATA\YogaDNS", "${env:ProgramFiles}\YogaDNS", "${env:ProgramFiles(x86)}\YogaDNS")
 $found = $false
 foreach ($d in $yoga) {
@@ -85,7 +95,7 @@ foreach ($d in $yoga) {
 }
 if (-not $found) { W '(no YogaDNS folder found)' }
 
-H 'Private Internet Access'
+Section 'Private Internet Access'
 $pia = Join-Path $env:ProgramFiles 'Private Internet Access'
 $ctl = Join-Path $pia 'piactl.exe'
 if (Test-Path $ctl) {
@@ -99,41 +109,74 @@ if (Test-Path $ctl) {
     } else { W '(PIA settings file not readable - run as administrator for these)' }
 } else { W 'PIA not found' }
 
-H 'PIA Lite'
+Section 'PIA Lite'
 $g = Join-Path $env:ProgramFiles 'PiaLite\pialite-guard.exe'
 if (Test-Path $g) { & $g version | ForEach-Object { W $_ }; & $g features | ForEach-Object { W $_ } } else { W 'not installed' }
 
-H 'Name lookups'
+Section 'Name lookups'
 foreach ($n in @('example.com', $Name) | Where-Object { $_ }) {
     $r = Resolve-DnsName $n -Type A -DnsOnly -ErrorAction SilentlyContinue
     W ($n + ' (system) -> ' + (($r | Where-Object { $_.IPAddress } | ForEach-Object { $_.IPAddress }) -join ', '))
 }
 
+# The TLS check is C#: a PowerShell script block as the certificate callback fails
+# in PowerShell 7 (it runs on a thread that has no PowerShell to run it).
+if ($Server -and -not ('PiaLiteTls' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
+public class PiaLiteTls {
+    public X509Certificate2 Cert;
+    public string Errors = "";
+    public string Protocol = "";
+    public static PiaLiteTls Probe(string host, int port, string sni) {
+        PiaLiteTls r = new PiaLiteTls();
+        using (TcpClient c = new TcpClient()) {
+            if (!c.ConnectAsync(host, port).Wait(3000)) throw new Exception("no connection");
+            c.ReceiveTimeout = 5000;
+            c.SendTimeout = 5000;
+            using (SslStream s = new SslStream(c.GetStream(), false, delegate (object o, X509Certificate ce, X509Chain ch, SslPolicyErrors e) {
+                if (ce != null) r.Cert = new X509Certificate2(ce);
+                r.Errors = e.ToString();
+                return true;
+            })) {
+                s.AuthenticateAsClient(sni);
+                r.Protocol = s.SslProtocol.ToString();
+            }
+        }
+        return r;
+    }
+}
+'@
+}
+
 if ($Server) {
-    H ("Your DNS server " + $Server + $(if ($Name) { " ($Name)" } else { '' }))
+    Section ("Your DNS server " + $Server + $(if ($Name) { " ($Name)" } else { '' }))
     $r = Resolve-DnsName example.com -Server $Server -Type A -DnsOnly -ErrorAction SilentlyContinue
     W ('plain DNS (53)        : ' + $(if ($r) { 'answers' } else { 'NO answer' }))
     foreach ($port in 853, 443, 8443) {
         $c = New-Object Net.Sockets.TcpClient
         $open = $c.ConnectAsync($Server, $port).Wait(2000) -and $c.Connected
         W ('TCP port ' + $port + '          : ' + $(if ($open) { 'open' } else { 'closed' }))
+        $c.Close()
         if ($open) {
             $sni = if ($Name) { $Name } else { $Server }
-            $script:cert = $null; $script:err = ''
-            $cb = [System.Net.Security.RemoteCertificateValidationCallback] { param($s, $ce, $ch, $e) $script:cert = $ce; $script:err = [string]$e; $true }
-            $ssl = New-Object System.Net.Security.SslStream($c.GetStream(), $false, $cb)
             try {
-                $ssl.AuthenticateAsClient($sni)
-                $x = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($script:cert)
+                $t = [PiaLiteTls]::Probe($Server, $port, $sni)
+                $x = $t.Cert
                 $san = ($x.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' } | ForEach-Object { $_.Format($false) })
                 W ('  TLS certificate     : ' + $x.Subject)
                 W ('  issued by           : ' + $x.Issuer)
                 W ('  names (SAN)         : ' + $san)
                 W ('  valid until         : ' + $x.NotAfter.ToString('yyyy-MM-dd'))
-                W ('  trusted by Windows  : ' + $(if ($script:err -eq 'None') { 'yes' } else { 'NO (' + $script:err + ')' }))
-                W ('  TLS version         : ' + $ssl.SslProtocol)
-            } catch { W ('  TLS: no handshake (' + $_.Exception.InnerException.Message + ')') }
-            $c.Close()
+                W ('  trusted by Windows  : ' + $(if ($t.Errors -eq 'None') { 'yes' } else { 'NO (' + $t.Errors + ')' }))
+                W ('  TLS version         : ' + $t.Protocol)
+            } catch {
+                $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }
+                W ('  TLS: no handshake (' + $ex.Message + ')')
+            }
         }
     }
     if ($Name) {
@@ -145,7 +188,7 @@ if ($Server) {
             } catch { W ($u + ' : ' + $_.Exception.Message) }
         }
     }
-    H 'Certificate authorities installed for it'
+    Section 'Certificate authorities installed for it'
     Get-ChildItem Cert:\LocalMachine\Root, Cert:\CurrentUser\Root | Where-Object { $_.Subject -match 'pi-hole|pihole|pi\.hole' -or ($Name -and $_.Subject -match [regex]::Escape($Name)) } |
         ForEach-Object { W ('- ' + $_.PSParentPath.Split(':')[-1] + '  ' + $_.Subject + '  thumbprint ' + $_.Thumbprint) }
 }

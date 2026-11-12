@@ -519,6 +519,9 @@ $ErrorActionPreference = 'SilentlyContinue'
 $pat = '__PATTERN__'
 $ad = @(foreach ($a in (Get-NetAdapter | Where-Object { $_.Status -eq 'Up' })) {
   if ($a.Name -like 'wgpia*' -or $a.InterfaceDescription -match 'Private Internet Access|WireGuard|TAP-Windows|Wintun') { continue }
+  # a network card bound to a Hyper-V virtual switch has no IP of its own; Windows
+  # ignores its DNS settings (the vEthernet adapter is the one in use)
+  if (-not (Get-NetIPInterface -InterfaceIndex $a.ifIndex)) { continue }
   $g = $a.InterfaceGuid
   $n4 = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$g").NameServer
   $n6 = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$g").NameServer
