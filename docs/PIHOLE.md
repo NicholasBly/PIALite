@@ -34,7 +34,9 @@ setLocal('127.0.0.1:5399')          -- dnsdist's own plain listener, moved off p
 addTLSLocal('0.0.0.0:853', '/etc/dnsdist/pihole.crt', '/etc/dnsdist/pihole.key', { minTLSVersion = 'tls1.2' })
 setACL({ '127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', 'fc00::/7', 'fe80::/10' })
 -- Pi-hole, with the asking PC's address passed on (Pi-hole: dns.EDNS0ECS = true, the default)
-newServer({ address = '192.168.1.2:53', useClientSubnet = true })
+-- dnsdist checks the backend is up; by default it asks Pi-hole for a.root-servers.net EVERY SECOND
+-- (86,400 lines a day in Pi-hole's query log, from 127.0.0.1). A name Pi-hole answers itself, once a minute:
+newServer({ address = '192.168.1.2:53', useClientSubnet = true, checkName = 'pi.hole.', checkInterval = 60 })
 setECSSourcePrefixV4(32)
 setECSSourcePrefixV6(128)
 setECSOverride(true)
