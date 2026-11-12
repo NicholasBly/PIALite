@@ -43,19 +43,23 @@ jobs:
       # the shell tests run in their own mount namespace (tests/isolate.sh). A
       # stand-in "real install" at EVERY real path install.sh can touch must be
       # untouched afterwards - also when the tests are started from a namespace
-      # whose mounts are shared (reviews R98-01, N99-01, N99-07)
+      # whose mounts are shared (reviews R98-01, N99-01, N99-07). And in
+      # throwaway roots missing a folder the tests write under, they must
+      # refuse before creating it (R10-01).
       - name: install.sh tests (uninstall checks, upgrade rollback) - isolated from real files
         run: |
           sentinels="/opt/pialite/MARKER /etc/xdg/autostart/pialite-tray.desktop /usr/local/bin/pialite-guard \
-            /usr/local/share/applications/pialite.desktop /var/lib/pialite/guard.json /etc/systemd/system/pialite-guard.service"
+            /usr/local/share/applications/pialite.desktop /var/lib/pialite/guard.json /etc/systemd/system/pialite-guard.service \
+            /run/pialite-install.lock"
           for f in $sentinels; do sudo mkdir -p "$(dirname "$f")"; echo sentinel | sudo tee "$f" >/dev/null; done
+          sudo sh tests/isolate-preflight.sh
           sudo sh tests/install-sh-uninstall.sh
           sudo sh tests/install-sh-upgrade.sh
           sudo unshare --mount --propagation shared sh tests/install-sh-uninstall.sh
           for f in $sentinels; do
             test "$(sudo cat "$f" 2>/dev/null)" = sentinel || { echo "a test touched the real $f"; exit 1; }
           done
-          if grep -q pialite-test /proc/self/mounts; then echo "a test's mounts leaked out"; exit 1; fi
+          if grep -q -e pialite-test -e preflight /proc/self/mounts; then echo "a test's mounts leaked out"; exit 1; fi
           for f in $sentinels; do sudo rm -f "$f"; done
           sudo rmdir /opt/pialite /var/lib/pialite 2>/dev/null || true
       - name: Packages (.deb, .rpm, .tar.gz)

@@ -21,7 +21,11 @@ On top of that you can **choose** extras when you install - nothing is forced on
 | **Network guard** (kill switch) | A tiny background service that blocks the internet until the VPN is connected - from power-on, or always. Works next to PIA's own kill switch as a second, independent layer. |
 | **Encrypted DNS** | Every DNS lookup goes over HTTPS to the provider *you* pick: Quad9, Cloudflare, AdGuard, Google, NextDNS (your own profile) or any DNS-over-HTTPS server. |
 | **Hotel Wi-Fi login** | One click turns the VPN off for a few minutes so you can get past a hotel/airport login page, then everything comes back by itself. |
-| **Updates** | The tray checks GitHub about once a day; one click installs a new release - only if its signature checks out - and keeps your features. |
+| **Updates** | The tray checks GitHub about once a day, or when you click *Check for updates* in its menu; one click installs a new release - only if its signature checks out - and keeps your features. |
+
+**Lighter than what it replaces:** on a Windows 11 PC that ran PIA's window and the NextDNS app, switching to PIA
+Lite took the memory those programs reserve from **187 MB to 22 MB**, and one small service now does the jobs of
+several programs - see [How much lighter?](#how-much-lighter)
 
 > PIA Lite is an independent open-source project. It is **not affiliated with, endorsed by or supported by
 > Private Internet Access**. You need a PIA subscription and PIA's own app installed.
@@ -34,6 +38,7 @@ On top of that you can **choose** extras when you install - nothing is forced on
 
 ## Contents
 
+- [How much lighter?](#how-much-lighter)
 - [Download and install](#download-and-install)
 - [Choosing features](#choosing-features)
 - [Encrypted DNS providers](#encrypted-dns-providers)
@@ -46,6 +51,44 @@ On top of that you can **choose** extras when you install - nothing is forced on
 - [Troubleshooting](#troubleshooting)
 - [Building from source](#building-from-source)
 - [Security](#security) - [Contributing](#contributing) - [License](#license)
+
+## How much lighter?
+
+Measured on one Windows 11 PC with PIA 3.6 in November 2026 - first with PIA's own window and the NextDNS app, then
+with PIA Lite.
+The numbers are **private memory**: what Windows reserves for that program alone (Task Manager > *Details* >
+right-click a column header > *Select columns* > **Commit size**).
+
+| Job | Before | Private memory | After (PIA Lite) | Private memory |
+|---|---|---|---|---|
+| Tray icon, connect, regions | PIA's window, hidden in the tray (`pia-client`) | 163 MB | `pialite-tray` | 2.4 MB |
+| Watching the VPN's state | (inside PIA's window) | - | 2 x PIA's own `piactl monitor` (one for the tray, one for the guard) | 17.5 MB |
+| Encrypted DNS | NextDNS app (`NextDNSService`) | 24 MB | `pialite-guard` - also the kill switch, the DNS leak block and hotel login | 2.2 MB |
+| **Total** | | **187 MB** | | **22 MB** |
+
+PIA's VPN services (`pia-service`, `pia-wgservice`) run either way and aren't counted. Your numbers will differ a
+little with your PIA version and what you turn on.
+
+- **Why Task Manager's default "Memory" column can show less:** Windows moves memory a hidden window isn't using
+  out of RAM - at that moment only about 34 MB of PIA's window was actually in RAM. Commit size is everything the
+  program still holds (in RAM or the page file), and it comes back into RAM as soon as the window is used.
+- **CPU:** don't expect a faster PC - idle CPU was close to zero before and after (PIA's hidden window averaged
+  0.03 %), and the tray and guard each showed 0.1 s of CPU time or less in the same measurement. PIA Lite keeps it
+  that way by doing little: the panel is drawn only while it is open, on the CPU (no web engine, no GPU process);
+  the connection is watched by `piactl monitor` instead of polling; the tray asks the guard for its status every
+  4 seconds and PIA for the region and IP once a minute or when something changes.
+- **Fewer programs at sign-in:** PIA's window no longer starts (PIA's VPN service keeps the VPN up), and there is
+  no separate DNS app.
+
+**One program instead of several:**
+
+| Instead of | PIA Lite has |
+|---|---|
+| PIA's window for everyday use | the tray icon and panel. PIA's full app is still installed for settings and split tunnel - *Open full PIA app* in the tray menu. |
+| The NextDNS app (or YogaDNS, or another DNS client) | encrypted DNS in the guard, with your **NextDNS profile** or any of the other providers. The Windows installer pauses the NextDNS service so the two don't fight; you can uninstall the NextDNS app afterwards. |
+| A DNS client's "block plain DNS" option | while the VPN is connected, DNS to any other server is blocked - plain DNS (port 53) and DNS over TLS (853). |
+| Turning the kill switch off by hand for a hotel login page | *Hotel Wi-Fi login*: VPN off for a few minutes, then everything comes back by itself. |
+| Watching the release page | *Check for updates* in the tray menu, or the daily check; signed updates install with one click. |
 
 ## Download and install
 
@@ -187,7 +230,10 @@ flowchart LR
 ## Updates
 
 About once a day (and never in the first minute and a half after sign-in) the tray asks GitHub whether a newer
-release exists. If so, the menu and the panel show **Install update x.y.z**:
+release exists - or right away when you click **Check for updates** in the tray menu. That line then says what the
+check found: *up to date* (with the version you have) or *last check failed* (offline, or GitHub didn't answer -
+never "up to date" when it couldn't tell). If there is a newer release, the menu and the panel show
+**Install update x.y.z**:
 
 1. you click it and confirm the administrator / password prompt;
 2. the guard downloads the package for *your* kind of install (MSI, .deb, .rpm or .tar.gz) into an admin-only folder;
@@ -195,8 +241,8 @@ release exists. If so, the menu and the panel show **Install update x.y.z**:
    ([keys/release-signing.pub](keys/release-signing.pub)) - otherwise nothing is installed;
 4. the installer runs with your current features, and PIA Lite restarts.
 
-The portable versions just point you to the download page. To turn the check off, set the environment variable
-`PIALITE_NO_UPDATE_CHECK=1`. From a terminal: `pialite-guard check-update` / `pialite-guard apply-update` (admin).
+The portable versions just point you to the download page. To turn the daily check off, set the environment
+variable `PIALITE_NO_UPDATE_CHECK=1` (*Check for updates* in the menu still works when you click it). From a terminal: `pialite-guard check-update` / `pialite-guard apply-update` (admin).
 
 Every release from 0.9.8 on is signed (a release can't be published unsigned), and before publishing, the release
 job checks it with the packaged program itself: `pialite-guard verify-release FOLDER` - the same check the

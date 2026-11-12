@@ -93,17 +93,29 @@ pub fn parse_update(json: &str) -> Option<Update> {
     })
 }
 
+/// What one check found: Ok(Some) = a newer release, Ok(None) = up to date,
+/// Err = no usable answer (offline, GitHub unreachable, an odd reply).
+pub fn parse_check(json: &str) -> Result<Option<Update>, String> {
+    let v: serde_json::Value = serde_json::from_str(json.trim()).map_err(|_| "no answer from the update check".to_string())?;
+    match v["newer"].as_bool() {
+        Some(false) => Ok(None),
+        Some(true) => parse_update(json).map(Some).ok_or_else(|| "the update check's answer has no version".to_string()),
+        None => Err("the update check's answer is incomplete".to_string()),
+    }
+}
+
 /// Ask the guard program (as this user - it only reads GitHub) whether a
-/// newer release exists. None = up to date, or the check failed.
-pub fn check_update() -> Option<Update> {
+/// newer release exists. Up to date and "couldn't check" are told apart, so
+/// the menu never says "up to date" after a failed check.
+pub fn check_update() -> Result<Option<Update>, String> {
     let mut c = std::process::Command::new(guard_exe());
-    c.args(["check-update", "--json"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    c.args(["check-update", "--json"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000);
     }
-    let mut child = c.stdout(std::process::Stdio::piped()).spawn().ok()?;
+    let mut child = c.stdout(std::process::Stdio::piped()).spawn().map_err(|e| format!("could not run the guard program: {e}"))?;
     let until = std::time::Instant::now() + std::time::Duration::from_secs(90);
     loop {
         match child.try_wait() {
@@ -112,12 +124,21 @@ pub fn check_update() -> Option<Update> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err("the update check took too long".into());
             }
         }
     }
-    let out = child.wait_with_output().ok()?;
-    parse_update(&String::from_utf8_lossy(&out.stdout))
+    let out = child.wait_with_output().map_err(|e| format!("update check: {e}"))?;
+    if !out.status.success() {
+        return Err(failure_reason(&String::from_utf8_lossy(&out.stderr)));
+    }
+    parse_check(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The guard program's last error line, for the tray log.
+fn failure_reason(stderr: &str) -> String {
+    let line = stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no reason given");
+    line.trim_start_matches("ERROR: ").chars().take(200).collect()
 }
 
 pub fn provider_name(id: &str) -> &str {
@@ -241,6 +262,18 @@ mod tests {
         let u = parse_update(r#"{"current":"0.9.0","latest":"0.9.1","newer":true,"signed":true,"one_click":true,"kind":"msi","page":"https://github.com/NicholasBly/PIALite/releases/tag/v0.9.1"}"#).unwrap();
         assert_eq!((u.latest.as_str(), u.one_click), ("0.9.1", true));
         assert!(parse_update(r#"{"latest":"0.9.0","newer":false}"#).is_none(), "up to date");
+        // a manual check must not say "up to date" when it got no answer
+        assert_eq!(parse_check(r#"{"latest":"0.9.0","newer":false}"#), Ok(None));
+        assert_eq!(parse_check(r#"{"latest":"0.9.1","newer":true}"#).unwrap().unwrap().latest, "0.9.1");
+        assert!(parse_check("").is_err(), "no output");
+        assert!(parse_check("PIA Lite 0.9.0 is up to date").is_err(), "not JSON");
+        assert!(parse_check(r#"{"latest":"0.9.1"}"#).is_err(), "no verdict");
+        assert!(parse_check(r#"{"newer":true}"#).is_err(), "newer, but no version");
+        assert_eq!(
+            failure_reason("ERROR: send: invalid peer certificate: UnknownIssuer\n"),
+            "send: invalid peer certificate: UnknownIssuer"
+        );
+        assert_eq!(failure_reason(""), "no reason given");
         let odd = parse_update(r#"{"latest":"9.9.9","newer":true,"page":"https://evil.example/"}"#).unwrap();
         assert!(odd.page.starts_with("https://github.com/"), "only GitHub pages are opened");
         assert!(safe_arg("guard,dns,hotel") && safe_arg("S-1-5-21-1-2-3") && safe_arg("abc123"));

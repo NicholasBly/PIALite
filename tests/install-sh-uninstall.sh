@@ -2,8 +2,8 @@
 # install.sh --uninstall with PIA Lite's program missing (review V95-05, F-08):
 # it may only say "removed" when it could CHECK that nothing is left.
 # Fake nft / systemctl; runs in its own mount namespace with /opt, /usr/local,
-# /var/lib and the unit folders hidden (tests/isolate.sh), so it can't touch a
-# real installation. Run as root: sudo sh tests/install-sh-uninstall.sh
+# /var/lib, /run and the unit folders hidden (tests/isolate.sh), so it can't
+# touch a real installation. Run as root: sudo sh tests/install-sh-uninstall.sh
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/isolate.sh"
@@ -35,5 +35,6 @@ printf '#!/bin/sh\necho "Failed to connect to bus" >&2; exit 1\n' > "$FAKE/syste
 case_ "systemd not answering" 1 "can't be asked"
 systemd_ok inactive disabled
 case_ "nothing left" 0 "PIA Lite removed."
+if still_isolated; then echo "PASS: nothing was created outside the hidden folders"; else echo "FAIL: something was created outside the hidden folders"; fails=$((fails + 1)); fi
 [ "$fails" = 0 ] && echo "all install.sh uninstall checks passed"
 exit "$fails"

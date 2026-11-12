@@ -27,8 +27,30 @@ struct State {
     guard: Option<guard::Status>, // None = guard service not reachable
     guard_polled: bool,
     notice: Option<(String, Instant)>, // short-lived error from a command, shown in menu/panel
-    update: Option<guard::Update>,     // a newer release (checked about once a day)
-    install: Option<guard::Install>,   // what the installer set up (install.json)
+    update: Option<guard::Update>,     // a newer release (checked about once a day, or from the menu)
+    update_check: UpdateCheck,
+    install: Option<guard::Install>, // what the installer set up (install.json)
+}
+
+/// Where the last update check got to (shown on the menu's "Check for updates").
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+enum UpdateCheck {
+    #[default]
+    NotYet,
+    Checking,
+    Done,
+    Failed,
+}
+
+/// The menu's "Check for updates" line. "Up to date" only after a check that
+/// answered; a newer release has its own "Install update" line above it.
+fn check_title(check: UpdateCheck, update: Option<&guard::Update>) -> String {
+    match (check, update) {
+        (UpdateCheck::Checking, _) => "Checking for updates...".into(),
+        (UpdateCheck::Failed, _) => "Check for updates (last check failed)".into(),
+        (UpdateCheck::Done, None) => format!("Check for updates (up to date: {})", env!("CARGO_PKG_VERSION")),
+        _ => "Check for updates".into(),
+    }
 }
 
 /// PIA's own "Connect on launch" setting, read as JSON (audit P3-25).
@@ -161,6 +183,8 @@ impl App {
         self.tray.set_hotel_feature(shown(st, "hotel"));
         self.tray.set_block_feature(shown(st, "guard"));
         self.tray.set_update_available(st.update.is_some());
+        self.tray.set_check_title(check_title(st.update_check, st.update.as_ref()).into());
+        self.tray.set_can_check(st.update_check != UpdateCheck::Checking);
         if let Some(u) = &st.update {
             self.tray.set_update_title(
                 if u.one_click {
@@ -517,6 +541,47 @@ fn after_update() {
     });
 }
 
+static CHECKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// One update check (at most one at a time), result shown on the menu.
+fn run_update_check(why: &str) {
+    use std::sync::atomic::Ordering;
+    if CHECKING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    post(|app| app.st.update_check = UpdateCheck::Checking);
+    let found = guard::check_update();
+    CHECKING.store(false, Ordering::SeqCst);
+    match found {
+        Ok(Some(u)) => {
+            log(&format!("update available: PIA Lite {} ({why})", u.latest));
+            post(move |app| {
+                app.st.update = Some(u);
+                app.st.update_check = UpdateCheck::Done;
+            });
+        }
+        Ok(None) => {
+            if why == "from the menu" {
+                log("checked for updates from the menu: up to date");
+            }
+            post(|app| {
+                app.st.update = None; // a release that was withdrawn isn't offered any more
+                app.st.update_check = UpdateCheck::Done;
+            });
+        }
+        Err(e) => {
+            log(&format!("update check failed ({why}): {e}"));
+            post(|app| app.st.update_check = UpdateCheck::Failed); // an update found earlier stays offered
+        }
+    }
+}
+
+/// "Check for updates" in the tray menu: check now, whatever the daily
+/// schedule (and even with PIALITE_NO_UPDATE_CHECK set - the user asked).
+fn check_now() {
+    std::thread::spawn(|| run_update_check("from the menu"));
+}
+
 fn start_update_checks() {
     if std::env::var_os("PIALITE_NO_UPDATE_CHECK").is_some() {
         return;
@@ -524,10 +589,7 @@ fn start_update_checks() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(90)); // not while signing in
         while !piactl::is_shutdown() {
-            if let Some(u) = guard::check_update() {
-                log(&format!("update available: PIA Lite {}", u.latest));
-                post(move |app| app.st.update = Some(u));
-            }
+            run_update_check("daily");
             // about once a day
             for _ in 0..(24 * 60) {
                 if piactl::is_shutdown() {
@@ -852,6 +914,7 @@ fn wire_tray(t: &Tray) {
     t.on_set_block_mode(|m| set_block_mode(m.to_string()));
     t.on_toggle_hotel(toggle_hotel);
     t.on_do_update(do_update);
+    t.on_check_updates(check_now);
     t.on_open_features(open_features);
     t.on_quit(|| {
         let _ = slint::quit_event_loop();
@@ -1181,6 +1244,21 @@ mod tests {
         assert!(!super::parse_connect_on_launch(r#"{"connectOnLaunch": false}"#));
         assert!(!super::parse_connect_on_launch(r#"{"note": "\"connectOnLaunch\":true"}"#), "text inside another field");
         assert!(!super::parse_connect_on_launch("not json"));
+    }
+
+    /// "Check for updates" in the tray menu: says "up to date" only after a
+    /// check that answered, and never while one runs or after one failed.
+    #[test]
+    fn the_check_for_updates_line_says_what_the_last_check_found() {
+        use super::{check_title, UpdateCheck::*};
+        let newer = crate::guard::Update { latest: "9.9.9".into(), one_click: true, page: String::new() };
+        assert_eq!(check_title(NotYet, None), "Check for updates");
+        assert_eq!(check_title(Checking, None), "Checking for updates...");
+        assert_eq!(check_title(Checking, Some(&newer)), "Checking for updates...");
+        assert_eq!(check_title(Done, None), format!("Check for updates (up to date: {})", env!("CARGO_PKG_VERSION")));
+        assert_eq!(check_title(Done, Some(&newer)), "Check for updates", "the Install line above says which version");
+        assert_eq!(check_title(Failed, None), "Check for updates (last check failed)");
+        assert!(!check_title(Failed, Some(&newer)).contains("up to date"));
     }
 }
 

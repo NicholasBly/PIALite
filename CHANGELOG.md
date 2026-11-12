@@ -2,6 +2,39 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.11] - 2026-11-12
+
+Fixes from the independent v0.9.10 review (R10-01 .. R10-06), and two requests.
+
+### Added
+- **Check for updates in the tray menu**: checks right away instead of waiting for the daily check. The line then
+  says what the check found - "up to date: x.y.z", or "last check failed" (offline, GitHub didn't answer). A check
+  that got no answer is never shown as "up to date". It also works with `PIALITE_NO_UPDATE_CHECK` set (that only
+  turns off the daily check).
+- **README: "How much lighter?"** - memory measured on a Windows 11 PC before and after (PIA's window + the NextDNS
+  app: 187 MB private memory; PIA Lite: 22 MB), what that number means, CPU (close to zero either way), and which
+  programs PIA Lite replaces.
+
+### Fixed
+- **The install.sh tests refuse where a folder they write under is missing** (R10-01): `/opt`, `/usr/local`,
+  `/var/lib` and `/run` must exist and be reached without a link, or the test stops before anything runs (it
+  would otherwise create that folder on the real system). Folders install.sh only deletes from may be missing;
+  the tests check at the end that they still are. The tests' own paths are checked too. New
+  `tests/isolate-preflight.sh` proves it in throwaway root filesystems (read-only binds of the system) with one
+  folder missing at a time; it runs in CI.
+- **An incomplete copy is never used to "restore"** (R10-02): the copy of the version in use is made in
+  `/opt/pialite.rollback.part`, marked complete, written to disk and only then renamed to `/opt/pialite.rollback`.
+  `--restore-previous` refuses an incomplete copy without stopping the guard; a copy left from before the guard
+  was stopped is recognized ("nothing to put back") and removed instead of restored.
+- **A failed stop is checked, not assumed** (R10-03): when `systemctl stop` fails, install.sh asks systemd for the
+  guard's real state, starts it again if it did stop, and checks its protection like after a rollback. It now says
+  "no program files were replaced" instead of "nothing was changed".
+- **Only one installer at a time** (R10-04): install, `--upgrade`, `--uninstall` and `--restore-previous` take a
+  lock (`flock` on `/run/pialite-install.lock`, which only root can create) before looking at anything; a second
+  one stops with "Another PIA Lite install ... is running".
+- **"PARTIALLY VERIFIED"** (R10-05): a rollback from a guard that didn't report its DNS block says so in those
+  words, never "protects as before".
+
 ## [0.9.10] - 2026-11-12
 
 Fixes from the independent v0.9.9 review (N99-01 .. N99-08).

@@ -32,6 +32,8 @@ export component Tray inherits SystemTrayIcon {
     in property <bool> block-feature: true;
     in property <bool> update-available: false;
     in property <string> update-title: "Update available";
+    in property <string> check-title: "Check for updates";
+    in property <bool> can-check: true;
     in property <string> features-title: "Features and DNS provider...";
 
     callback show-panel();
@@ -43,6 +45,7 @@ export component Tray inherits SystemTrayIcon {
     callback set-block-mode(string);
     callback toggle-hotel();
     callback do-update();
+    callback check-updates();
     callback open-features();
     callback quit();
 
@@ -95,6 +98,7 @@ export component Tray inherits SystemTrayIcon {
         }
         MenuSeparator { }
         if root.update-available: MenuItem { title: root.update-title; activated => { root.do-update(); } }
+        MenuItem { title: root.check-title; enabled: root.can-check; activated => { root.check-updates(); } }
         MenuItem { title: "Show panel"; activated => { root.show-panel(); } }
         MenuItem { title: "Open full PIA app (settings, split tunnel...)"; activated => { root.open-pia(); } }
         MenuItem { title: root.features-title; activated => { root.open-features(); } }

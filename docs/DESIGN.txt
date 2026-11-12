@@ -519,3 +519,16 @@ What is protected, from what, and what is NOT claimed.
    copy also holds the menu entry, icon, absent-file markers and the
    guard's earlier mode + DNS state; restore_previous checks every step and
    the DNS block before "as before".
+   0.9.11 (review R10): tests/isolate.sh: WRITE folders (/opt /usr/local
+   /var/lib /run) must exist, without a link on the way, else refuse;
+   REMOVE-ONLY folders may be missing and must still be at the end; tmpfs
+   mounted with -n (no /run/mount/utab). tests/isolate-preflight.sh: chroot
+   into tmpfs + read-only binds with one WRITE folder missing -> refusal,
+   folder not created. install.sh: flock on /run/pialite-install.lock for
+   every mode; copy built in /opt/pialite.rollback.part, checked, "complete"
+   written, sync, renamed to /opt/pialite.rollback; "guard-stopped" written
+   just before the stop (a complete copy without it = nothing was changed:
+   removed, never restored); failed stop -> ActiveState, start again if not
+   active, watch_guard + verdict; unknown earlier DNS = PARTIALLY VERIFIED.
+   Tray: "Check for updates" menu item (check_update tells "up to date"
+   from "couldn't check").

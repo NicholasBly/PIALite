@@ -6,12 +6,26 @@ these runs are the evidence. Keep PIA's own kill switch **on** in normal use: it
 
 ## 1. Automatic (CI must be green on the tagged commit)
 
-- [ ] Linux: fmt, clippy, tests, `selftest-firewall` (real nftables), packages, real `.deb` install +
+- [ ] Linux: fmt, clippy, tests, `selftest-firewall` (real nftables), the install.sh tests (isolated, with
+      stand-ins at every real path, and the preflight in throwaway roots), packages, real `.deb` install +
       `setup` + `test-dns` + removal leaving nothing behind
 - [ ] Windows: clippy, tests, `selftest-firewall` (real WFP), MSI build + ICE validation, silent install +
       uninstall leaving nothing behind
 - [ ] Publish (automatic: it runs only after both CI jobs pass): `SHA256SUMS` signed, and the packaged
       `pialite-guard verify-release` accepts the release and refuses a tampered package
+
+CI runners have no PIA VPN and install the guard in Off mode (Linux): CI shows the rules are built and the
+installers behave, **not** that nothing leaks from power-on. Never claim that from CI alone (review R10-06).
+
+## Record for every manual run (sections 2 and 3)
+
+Use a test machine you can reinstall. Keep with the reports:
+
+- [ ] SHA-256 of the installed `pialite-guard` and `pialite-tray` (they must match `SHA256SUMS`' packages)
+- [ ] OS version and build, PIA version, the block mode and DNS provider set
+- [ ] Adapter and route state at each step (`Get-NetIPInterface` + `route print` / `ip addr` + `ip route`, IPv4 and IPv6)
+- [ ] A packet capture of each leak test, with a **positive control**: the same capture with the guard off
+      must show the traffic (else the capture proves nothing). Redact your IP addresses before sharing.
 
 ## 2. Windows (on a real PC with PIA)
 
@@ -32,6 +46,8 @@ line names the exact programs tested). A FAIL, or an unexplained INCONCLUSIVE, s
       (`show-rules`), PIA's DNS and kill switch as before, PIA's window starts at sign-in again
 - [ ] Tray: sign in right after a restart, restart Explorer, start PIA Lite a second time - exactly one icon
 - [ ] Update: with a test release, *Install update* installs it and the tray comes back
+- [ ] Tray menu *Check for updates*: online it says "up to date" (or offers the newer release); with the network
+      unplugged it says "last check failed", never "up to date"
 
 ## 3. Linux (on a real desktop with PIA)
 
@@ -44,7 +60,8 @@ On at least one Debian/Ubuntu and one Fedora machine:
 - [ ] Sleep/wake; Disconnect in the tray is respected; hotel login start/stop
 - [ ] Tray icon on KDE and on GNOME (with the AppIndicator extension); panel opens; region change works
 - [ ] Remove the package: no `pialite` nftables tables, DNS works normally
-- [ ] tar.gz: `install.sh`, `install.sh --upgrade`, `install.sh --uninstall`
+- [ ] tar.gz: `install.sh`, `install.sh --upgrade`, `install.sh --uninstall`; a second `install.sh --upgrade`
+      started while one runs says "Another PIA Lite install ... is running"
 
 ## 4. Known limitations (say them, don't hide them)
 
