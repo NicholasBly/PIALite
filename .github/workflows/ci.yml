@@ -90,6 +90,17 @@ jobs:
         run: |
           .\target\release\pialite-guard.exe adapter-dns
           .\target\release\pialite-guard.exe adapter-dns --json
+      - name: DNS report script (PowerShell 7 and Windows PowerShell 5.1)
+        shell: pwsh
+        run: |
+          foreach ($sh in 'pwsh', 'powershell') {
+            & $sh -NoProfile -ExecutionPolicy Bypass -File tools/dns-report.ps1 -Server 1.1.1.1 -Name one.one.one.one
+            $r = Get-Content (Join-Path ([Environment]::GetFolderPath('Desktop')) 'PIALite-DNS-report.txt') -Raw
+            foreach ($want in '== Network adapters', '== Your DNS server 1.1.1.1', 'TLS certificate     : CN=') {
+              if (-not $r.Contains($want)) { throw "$sh report is missing '$want'" }
+            }
+            if ($r -match 'no handshake') { throw "$sh report: TLS check failed" }
+          }
       - name: WiX Toolset
         run: |
           dotnet tool install --global wix --version 5.0.2
