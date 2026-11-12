@@ -1046,15 +1046,21 @@ impl Guard {
         }
     }
 
-    /// Linux: plain DNS is redirected to the proxy only while the proxy is
-    /// listening - a proxy that could not start (port 53 taken by another
-    /// program) must not take the computer's DNS down with it. `recheck`:
-    /// also look whether the rules are really still there (every 30 s).
+    /// Plain DNS only through the guard - Linux: redirected to the proxy;
+    /// Windows: DNS to any other server blocked (firewall::dns_capture). Only
+    /// while the proxy is listening - a proxy that could not start (port 53
+    /// taken by another program) must not take the computer's DNS down with
+    /// it - and on Windows only while Windows really sends its lookups to the
+    /// guard (PIA's adapter has 127.0.0.1 as its DNS, i.e. the VPN is
+    /// connected with PIA's DNS setting applied). `recheck`: also look
+    /// whether the rules are really still there (every 30 s).
     fn sync_dns_capture(&self, recheck: bool) {
-        if !cfg!(any(test, target_os = "linux")) {
+        if !cfg!(any(test, target_os = "linux", windows)) {
             return;
         }
-        let want = self.cfg().features().dns && self.proxy.stats.listening.load(Ordering::Relaxed);
+        let want = self.cfg().features().dns
+            && self.proxy.stats.listening.load(Ordering::Relaxed)
+            && (!cfg!(windows) || crate::netif::vpn_dns_is_guard());
         let mut have = self.dns_capture.lock().unwrap();
         if recheck && *have == Some(true) {
             match firewall::dns_capture_active() {
@@ -1072,11 +1078,19 @@ impl Guard {
         let was = *have;
         if let Err(e) = firewall::dns_capture(want) {
             // logged once; a missing redirect is found again by the 30 s check
-            log(&format!("could not {} the DNS redirect: {e}", if want { "add" } else { "remove" }));
+            log(&format!("could not {} the DNS block/redirect: {e}", if want { "add" } else { "remove" }));
         } else if want {
-            log("plain DNS from programs now goes to the encrypted DNS proxy");
+            log(if cfg!(windows) {
+                "DNS to other servers is now blocked - lookups only go through the guard"
+            } else {
+                "plain DNS from programs now goes to the encrypted DNS proxy"
+            });
         } else if was == Some(true) {
-            log("DNS redirect removed (the proxy is not listening)");
+            log(if cfg!(windows) {
+                "DNS block lifted (VPN not connected, or the proxy is not listening)"
+            } else {
+                "DNS redirect removed (the proxy is not listening)"
+            });
         }
         *have = Some(want);
     }
@@ -1485,6 +1499,8 @@ impl Guard {
                 [("dns", f.dns), ("hotel", f.hotel)].iter().filter(|(_, on)| *on).map(|(n, _)| n.to_string()).collect()
             }),
             dns_provider: if cfg.features().dns { cfg.provider().to_string() } else { String::new() },
+            dns_tls: cfg.features().dns && cfg.dot(),
+            dns_only_guard: cfg.features().dns.then(|| *self.dns_capture.lock().unwrap() == Some(true)),
             approved_accounts: cfg.allowed_sids.len() as u32,
             vpn_adapter,
             tunnel_watch,

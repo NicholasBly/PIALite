@@ -234,12 +234,26 @@ fn pretty_status(s: &GuardStatus) -> String {
             } else {
                 match s.dns.health {
                     DnsHealth::Untested => "listening, no lookups yet".into(),
-                    DnsHealth::Ok => format!("OK - {} over HTTPS ({} ms last lookup)", provider_name(&s.dns_provider), s.dns.last_ms),
+                    DnsHealth::Ok => format!(
+                        "OK - {} over {} ({} ms last lookup)",
+                        provider_name(&s.dns_provider),
+                        if s.dns_tls { "TLS" } else { "HTTPS" },
+                        s.dns.last_ms
+                    ),
                     DnsHealth::Degraded => "working, some recent lookups failed".into(),
                     DnsHealth::Down => format!("lookups failing: {}", s.dns.last_error),
                 }
             }
         ),
+        match s.dns_only_guard {
+            Some(true) if cfg!(windows) => "Other DNS      : blocked - every lookup goes through the guard".to_string(),
+            Some(true) => "Other DNS      : redirected to the guard".to_string(),
+            Some(false) if cfg!(windows) => {
+                "Other DNS      : not blocked (only while the VPN is connected and PIA's DNS points at the guard)".to_string()
+            }
+            Some(false) => "Other DNS      : not redirected (the DNS proxy isn't listening)".to_string(),
+            None => String::new(),
+        },
         format!(
             "Lookups        : {} answered, {} failed, {} refused (overload), {} malformed",
             s.dns.answered, s.dns.failed, s.dns.overloaded, s.dns.malformed
@@ -292,6 +306,7 @@ fn pretty_status(s: &GuardStatus) -> String {
             out.push(format!("PROBLEM ({label}): {e}"));
         }
     }
+    out.retain(|l| !l.is_empty());
     out.join("\n")
 }
 
@@ -413,7 +428,7 @@ fn set_users(ids: &str) -> Result<(), String> {
 fn provider_name(id: &str) -> &str {
     match id {
         "" => "encrypted DNS",
-        "custom" => "your DoH server",
+        "custom" => "your DNS server",
         _ => config::preset(id).map(|p| p.name).unwrap_or(id),
     }
 }
@@ -773,7 +788,14 @@ fn os_resolver_check() -> (Option<bool>, String) {
                 Err(e) => return (None, format!("can't check: {e}")),
             }
         }
-        note = "the system's resolver did NOT send a test lookup to the guard - it uses another DNS server".into();
+        note = if cfg!(windows) {
+            "the system's resolver did NOT send a test lookup to the guard - it uses another DNS server. \
+             PIA applies its DNS setting when it connects: if PIA Lite was installed or changed while \
+             connected, disconnect and reconnect PIA, then try again"
+        } else {
+            "the system's resolver did NOT send a test lookup to the guard - it uses another DNS server"
+        }
+        .into();
     }
     (Some(false), note)
 }
@@ -936,11 +958,12 @@ fn test_doh(profile: Option<&str>) -> Result<(), String> {
         return Err("no NextDNS profile saved yet".into());
     }
     let name = provider_name(cfg.provider()).to_string();
+    let how = if cfg.dot() { "TLS" } else { "HTTPS" };
     let d = doh::Doh::from_config(&cfg)?;
     let a = d.resolve(&dns::build_query(0x4242, "example.com", 1)?)?;
     match dns::summary(&a) {
         Some((0, n)) if n > 0 => {
-            println!("OK: {name} answered over HTTPS ({n} records)");
+            println!("OK: {name} answered over {how} ({n} records)");
             Ok(())
         }
         other => Err(format!("{name} answered oddly: {other:?}")),
@@ -1244,6 +1267,10 @@ fn selftest_firewall(force: bool) -> Result<(), String> {
     let specs = specs.unwrap_or_default();
     check("rules exactly as planned", firewall::verify(&specs));
     check("block floor recognised", firewall::block_floor(&firewall::known_shapes(&apps, false, &specs)));
+    #[cfg(windows)]
+    check("DNS to other servers blocked by the DNS block; the guard itself gets through", windows_dns_block_test());
+    #[cfg(windows)]
+    check("block floor still recognised next to the DNS block", firewall::block_floor(&firewall::known_shapes(&apps, false, &specs)));
     #[cfg(not(windows))]
     {
         // a stray permit in the guard's "open" chain must be caught
@@ -1271,6 +1298,57 @@ fn selftest_firewall(force: bool) -> Result<(), String> {
         println!("all firewall checks passed");
         Ok(())
     }
+}
+
+/// Windows, with the temporary allow-all in place: before the DNS block a
+/// program (PowerShell) gets an answer from 9.9.9.9; with it, its lookup and
+/// its DNS-over-TLS connection are refused while the guard's own connection
+/// to 9.9.9.9:853 gets through; after it, lookups work again.
+#[cfg(windows)]
+fn windows_dns_block_test() -> Result<(), String> {
+    use std::time::Duration;
+    let ps = |script: &str| -> bool {
+        std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    // a different name each time, so no cached answer counts
+    let lookup = |name: &str| {
+        format!("try {{ if (Resolve-DnsName {name} -Server 9.9.9.9 -Type A -DnsOnly -QuickTimeout -ErrorAction Stop) {{ exit 0 }} }} catch {{}}; exit 1")
+    };
+    const TLS: &str =
+        "$c = New-Object Net.Sockets.TcpClient; try { if ($c.ConnectAsync('9.9.9.9', 853).Wait(3000)) { exit 0 } } catch {}; exit 1";
+    if !ps(&lookup("example.com")) {
+        return Err("no answer from 9.9.9.9 even before the DNS block (no network?)".into());
+    }
+    firewall::dns_capture(true)?;
+    let during = (|| {
+        if !firewall::dns_capture_active()? {
+            return Err("the DNS block isn't there after adding it".into());
+        }
+        if ps(&lookup("example.net")) {
+            return Err("a program's own lookup at 9.9.9.9 was NOT blocked".into());
+        }
+        if ps(TLS) {
+            return Err("a program's DNS-over-TLS connection to 9.9.9.9 was NOT blocked".into());
+        }
+        let addr: std::net::SocketAddr = "9.9.9.9:853".parse().map_err(|_| "address")?;
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .map_err(|e| format!("the guard's own connection to 9.9.9.9:853 was blocked: {e}"))?;
+        Ok(())
+    })();
+    let removed = firewall::dns_capture(false);
+    during?;
+    removed?;
+    if firewall::dns_capture_active()? {
+        return Err("the DNS block is still there after removing it".into());
+    }
+    if !ps(&lookup("example.org")) {
+        return Err("lookups at 9.9.9.9 still fail after removing the DNS block".into());
+    }
+    Ok(())
 }
 
 /// In the test namespace: a virtual network with a default route, a fake DNS

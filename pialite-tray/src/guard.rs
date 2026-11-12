@@ -127,7 +127,7 @@ pub fn provider_name(id: &str) -> &str {
         "quad9" => "Quad9",
         "adguard" => "AdGuard",
         "google" => "Google",
-        "custom" => "your DoH server",
+        "custom" => "your DNS server",
         other => other,
     }
 }

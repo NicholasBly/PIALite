@@ -142,6 +142,12 @@ pub struct GuardStatus {
     pub features: Option<Vec<String>>,
     /// The encrypted DNS provider in use ("" = encrypted DNS off).
     pub dns_provider: String,
+    /// It is reached over DNS over TLS (port 853), not HTTPS.
+    pub dns_tls: bool,
+    /// Plain DNS can only go through the guard right now: Windows - DNS to
+    /// other servers is blocked; Linux - it is redirected to the proxy.
+    /// None = an older guard / encrypted DNS off.
+    pub dns_only_guard: Option<bool>,
 }
 
 /// The guard's tunnel check, in words (GuardStatus::tunnel_watch).

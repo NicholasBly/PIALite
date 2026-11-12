@@ -601,7 +601,7 @@ fn hook_up_dns(cfg: &Config, dns: bool, rep: &mut Report) {
         // check the provider answers before relying on it
         if let Err(e) = test_provider(cfg) {
             if cfg.provider() == "custom" {
-                rep.warn(format!("your DoH server didn't answer ({e}) - PIA's DNS was NOT changed; fix it and run setup again"));
+                rep.warn(format!("your DNS server didn't answer ({e}) - PIA's DNS was NOT changed; fix it and run setup again"));
                 return;
             }
             rep.warn(format!("{} didn't answer right now ({e}) - continuing (it is retried once the VPN is connected)", cfg.provider()));

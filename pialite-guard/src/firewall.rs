@@ -2013,13 +2013,87 @@ mod win {
         Ok(())
     }
 
-    /// Windows: lookups reach the proxy through PIA's DNS setting (127.0.0.1),
-    /// set by setup - no redirect needed.
-    pub fn dns_capture(_on: bool) -> Result<(), String> {
+    // ------------------------------------- plain DNS only through the guard
+
+    /// Windows sends lookups to the guard through PIA's DNS setting
+    /// (127.0.0.1). This block makes sure nothing goes AROUND it: while it is
+    /// on, plain DNS (port 53) and DNS over TLS (port 853) to any other server
+    /// are refused - programs that ask 8.8.8.8 themselves, Windows asking
+    /// other adapters' DNS servers in parallel, VMs that borrow this PC's
+    /// connection. Allowed: loopback (the guard's proxy), PIA's own programs
+    /// and the guard itself (its encrypted DNS to the provider).
+    ///
+    /// Its own sublayer in a temporary (dynamic) WFP session, no provider: the
+    /// internet block's checks don't see it, and if the guard stops, Windows
+    /// removes it by itself - it can never leave the PC without DNS.
+    const DNS_SUBLAYER: GUID = GUID::from_u128(0x5a1f7e2c_3b4d_4c8a_9e61_2f0b6d1c7a03);
+    static DNS_BLOCK: std::sync::Mutex<Option<Engine>> = std::sync::Mutex::new(None);
+
+    fn dns_sublayer_there(e: &Engine) -> bool {
+        let mut s: *mut FWPM_SUBLAYER0 = null_mut();
+        let found = unsafe { FwpmSubLayerGetByKey0(e.0, &DNS_SUBLAYER, &mut s) } == 0 && !s.is_null();
+        if found {
+            unsafe { FwpmFreeMemory0(&mut s as *mut _ as *mut *mut c_void) };
+        }
+        found
+    }
+
+    fn add_dns_filter(e: &Engine, v6: bool, weight: u8, permit: bool, cond: &Cond, name: &str) -> Result<(), String> {
+        let mut conds = build(cond, v6)?;
+        let wname = wide(&format!("PIA Lite: {name}"));
+        let mut f = FWPM_FILTER0::default();
+        f.displayData.name = wname.as_ptr() as *mut u16;
+        f.layerKey = layer(v6);
+        f.subLayerKey = DNS_SUBLAYER;
+        f.weight = FWP_VALUE0 { r#type: FWP_UINT8, Anonymous: FWP_VALUE0_0 { uint8: weight } };
+        f.numFilterConditions = conds.list.len() as u32;
+        f.filterCondition = if conds.list.is_empty() { null_mut() } else { conds.list.as_mut_ptr() };
+        f.action.r#type = if permit { FWP_ACTION_PERMIT } else { FWP_ACTION_BLOCK };
+        let mut id = 0u64;
+        check(&format!("Adding rule '{name}'"), unsafe { FwpmFilterAdd0(e.0, &f, null_mut(), &mut id) })
+    }
+
+    pub fn dns_capture(on: bool) -> Result<(), String> {
+        let mut held = DNS_BLOCK.lock().unwrap();
+        if !on {
+            *held = None; // closing the session removes its sublayer and rules
+            return Ok(());
+        }
+        if held.as_ref().is_some_and(dns_sublayer_there) {
+            return Ok(());
+        }
+        *held = None;
+        let e = Engine::open(true)?;
+        let mut allowed = crate::pia::engine_exes();
+        if let Ok(me) = std::env::current_exe() {
+            allowed.push(me.to_string_lossy().into_owned());
+        }
+        let sname = wide("PIA Lite: plain DNS only through the guard");
+        e.txn_as("Adding the DNS block", || {
+            let s = FWPM_SUBLAYER0 {
+                subLayerKey: DNS_SUBLAYER,
+                displayData: FWPM_DISPLAY_DATA0 { name: sname.as_ptr() as *mut u16, description: null_mut() },
+                weight: SUBLAYER_WEIGHT - 1,
+                ..Default::default()
+            };
+            check("Adding the DNS block's sublayer", unsafe { FwpmSubLayerAdd0(e.0, &s, null_mut()) })?;
+            for v6 in [false, true] {
+                add_dns_filter(&e, v6, 15, true, &Cond::Loopback, "DNS block: allow loopback (the guard's DNS proxy)")?;
+                for a in &allowed {
+                    let file = a.rsplit(['\\', '/']).next().unwrap_or(a);
+                    add_dns_filter(&e, v6, 14, true, &Cond::App(a.clone()), &format!("DNS block: allow {file}"))?;
+                }
+                add_dns_filter(&e, v6, 1, false, &Cond::RemotePort(53), "DNS block: no plain DNS around the guard")?;
+                add_dns_filter(&e, v6, 1, false, &Cond::RemotePort(853), "DNS block: no DNS over TLS around the guard")?;
+            }
+            Ok(())
+        })?;
+        *held = Some(e);
         Ok(())
     }
+
     pub fn dns_capture_active() -> Result<bool, String> {
-        Ok(false)
+        Ok(DNS_BLOCK.lock().unwrap().as_ref().is_some_and(dns_sublayer_there))
     }
 
     pub fn open_all() -> Result<OpenAll, String> {

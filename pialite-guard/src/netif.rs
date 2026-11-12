@@ -287,6 +287,84 @@ pub fn snapshot() -> Option<Snapshot> {
     None
 }
 
+/// Is Windows sending lookups to the guard right now? True when one of PIA's
+/// adapters is up and has 127.0.0.1 among its DNS servers - PIA puts its DNS
+/// setting on its adapter when it connects (so a setting changed while
+/// connected only counts after a reconnect). The plain-DNS block waits for
+/// this, so it can never take DNS away from Windows.
+#[cfg(all(windows, not(test)))]
+pub fn vpn_dns_is_guard() -> bool {
+    use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC};
+
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_UNICAST;
+    let mut size: u32 = 32 * 1024;
+    for _ in 0..3 {
+        let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+        let first = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+        let rc = unsafe { GetAdaptersAddresses(AF_UNSPEC as u32, flags, std::ptr::null(), first, &mut size) };
+        if rc == ERROR_BUFFER_OVERFLOW {
+            continue;
+        }
+        if rc != 0 {
+            return false;
+        }
+        let text = |p: *mut u16| -> String {
+            if p.is_null() {
+                return String::new();
+            }
+            let mut n = 0;
+            while unsafe { *p.add(n) } != 0 && n < 512 {
+                n += 1;
+            }
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, n) })
+        };
+        let mut a = first;
+        while !a.is_null() {
+            let r = unsafe { &*a };
+            if r.OperStatus == IfOperStatusUp && is_pia(&text(r.FriendlyName), &text(r.Description)) {
+                let mut servers = vec![];
+                let mut d = r.FirstDnsServerAddress;
+                while !d.is_null() {
+                    let da = unsafe { &*d };
+                    let sa = da.Address.lpSockaddr as *const u8;
+                    let len = da.Address.iSockaddrLength.max(0) as usize;
+                    if !sa.is_null() && len >= 8 {
+                        let b = unsafe { std::slice::from_raw_parts(sa, len) };
+                        if u16::from_ne_bytes([b[0], b[1]]) == AF_INET {
+                            servers.push(std::net::IpAddr::from([b[4], b[5], b[6], b[7]]));
+                        }
+                    }
+                    d = da.Next;
+                }
+                if dns_is_guard(&servers) {
+                    return true;
+                }
+            }
+            a = r.Next;
+        }
+        return false;
+    }
+    false
+}
+
+/// Elsewhere: not used (Linux redirects plain DNS instead of blocking it).
+#[cfg(not(all(windows, not(test))))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn vpn_dns_is_guard() -> bool {
+    true
+}
+
+/// One adapter's DNS servers point at the guard's proxy.
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub fn dns_is_guard(servers: &[std::net::IpAddr]) -> bool {
+    servers.iter().any(|ip| *ip == std::net::IpAddr::from([127, 0, 0, 1]))
+}
+
 /// Elsewhere (tests): a stand-in. By default Wi-Fi is up and PIA's "wgpia0"
 /// is up; tests change that or make the look fail.
 #[cfg(any(test, not(any(windows, target_os = "linux"))))]
@@ -358,6 +436,15 @@ pub fn reset_test_net() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vpn_dns_pointing_at_the_guard() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(super::dns_is_guard(&[ip("127.0.0.1")]));
+        assert!(super::dns_is_guard(&[ip("10.0.0.243"), ip("127.0.0.1")]));
+        assert!(!super::dns_is_guard(&[ip("10.0.0.243")]), "PIA's own DNS: the setting isn't applied yet");
+        assert!(!super::dns_is_guard(&[]));
+    }
+
     use super::*;
 
     /// Linux parsing: default routes, ready IPv6 addresses, the routed device.
