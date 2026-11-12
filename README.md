@@ -126,6 +126,10 @@ certificate. Lookups go over HTTPS (DoH), or over TLS on port 853 (DoT) for Quad
 
 - **Windows:** PIA's DNS setting is pointed at the guard (`127.0.0.1`); your previous setting is saved and put back
   on uninstall. If the NextDNS Windows app is installed, it is paused (not removed) so two DNS programs don't fight.
+  While the VPN is connected, **DNS to any other server is blocked** (plain DNS on port 53 and DNS over TLS on 853):
+  a program that asks 8.8.8.8 itself gets no answer, and neither do VMs that share this PC's connection. PIA's own
+  programs and the guard are let through. (PIA applies its DNS setting when it connects - after installing while
+  connected, reconnect PIA once; `pialite-guard status` shows "Other DNS : blocked" when it is on.)
 - **Linux:** the guard redirects every program's plain DNS (port 53) to itself with an nftables rule - whatever
   your distribution uses for DNS (systemd-resolved, NetworkManager, resolv.conf). PIA's own lookups are left alone.
 - **Conflicts are reported, not hidden.** Setup (and `pialite-guard adapter-dns`) checks for things that would let

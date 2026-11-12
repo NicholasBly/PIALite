@@ -1324,7 +1324,7 @@ fn windows_dns_block_test() -> Result<(), String> {
         return Err("no answer from 9.9.9.9 even before the DNS block (no network?)".into());
     }
     firewall::dns_capture(true)?;
-    let during = (|| {
+    let during = (|| -> Result<(), String> {
         if !firewall::dns_capture_active()? {
             return Err("the DNS block isn't there after adding it".into());
         }

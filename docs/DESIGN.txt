@@ -452,3 +452,18 @@ What is protected, from what, and what is NOT claimed.
    changes none of them except pausing the NextDNS app. `adapter-dns --reset`
    (admin, on request) sets typed-in adapter DNS to automatic, saving the old
    values in adapter-dns-before.json; teardown puts them back.
+   0.9.5: Windows DNS block. While Windows sends its lookups to the guard
+   (one of PIA's adapters is up with 127.0.0.1 among its DNS servers - PIA
+   applies its DNS setting when it connects) and the proxy listens, a
+   temporary (dynamic) WFP session holds its own sublayer, no provider:
+   weight 15 permit loopback, 14 permit each PIA program and the guard's own
+   exe, 1 block remote port 53 and 853 (v4 and v6). Separate sublayer, so it
+   blocks whatever the internet block's allow-all permits (a block in any
+   sublayer wins); no provider, so the internet block's checks don't count
+   it. Lifted when the VPN goes down or the proxy stops; Windows removes it
+   with the session if the guard ends, so it can never leave the PC without
+   DNS. Checked every 30 s (sublayer still there). Not covered: DNS over
+   HTTPS on port 443 straight to a provider (browsers' "secure DNS").
+   selftest-firewall checks it on Windows: a child process's lookup at
+   9.9.9.9 and its TCP connection to 9.9.9.9:853 are refused, the guard's
+   own connection to 9.9.9.9:853 gets through, and lookups work again after.

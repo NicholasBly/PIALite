@@ -90,5 +90,11 @@ At install time the same works with `pialite-guard setup --dns custom --doh-url 
 - **One DNS program at a time.** If YogaDNS, the NextDNS app or another DNS program is running, turn it off while
   PIA Lite does encrypted DNS - or keep that program and install PIA Lite *without* "Encrypted DNS". `setup` and
   `pialite-guard adapter-dns` tell you what they find.
+- **Nothing goes around the Pi-hole while the VPN is connected (Windows).** PIA Lite blocks DNS to every other
+  server then (ports 53 and 853), so a program or VM that asks 8.8.8.8 itself gets no answer. Browsers' own
+  "secure DNS" (DNS over HTTPS to Google / Cloudflare) can't be told apart from web traffic - turn it off in the
+  browser's settings. Pi-hole already switches Firefox's off for you.
+- **Your YogaDNS block lists** belong in Pi-hole now (Domains page, or `sudo pihole deny NAME ...`): they then
+  apply to every device, and you see them in the Query Log.
 - **YogaDNS instead?** YogaDNS can also speak DNS over TLS to the dnsdist above. Then install PIA Lite without
   "Encrypted DNS" and let YogaDNS do it; the kill switch works the same either way.

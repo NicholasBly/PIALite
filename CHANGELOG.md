@@ -2,6 +2,22 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.5] - 2026-11-12
+
+### Added
+- **Windows: DNS to other servers is blocked while the VPN is connected** (plain DNS on port 53 and DNS over TLS on
+  853), so nothing goes around the guard - a program asking 8.8.8.8 itself, Windows asking another adapter's DNS
+  server, VMs sharing the PC's connection. Allowed: loopback (the guard's proxy), PIA's programs, the guard. It is on
+  only while Windows really sends lookups to the guard (PIA's adapter has 127.0.0.1 as its DNS) and the proxy is
+  listening, in a temporary firewall session that Windows removes by itself if the guard stops - it can't leave the
+  PC without DNS. `status` shows it ("Other DNS"); the firewall self-test checks it on a real Windows machine.
+
+### Changed
+- `status` / `set-dns` say "over TLS" for servers reached that way (Quad9, `tls://` servers) - it said HTTPS.
+- "your DoH server" is now "your DNS server" (custom servers can be DNS over TLS too).
+- `test-dns` on Windows: when Windows doesn't use the guard yet, it says to reconnect PIA (PIA applies its DNS
+  setting when it connects).
+
 ## [0.9.4] - 2026-11-12
 
 ### Added
