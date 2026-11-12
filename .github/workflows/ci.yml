@@ -17,7 +17,7 @@ jobs:
     name: Linux (build, tests, nftables, packages, real install)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -36,7 +36,7 @@ jobs:
         run: sudo unshare --net ./target/release/pialite-guard selftest-firewall
       - name: Packages (.deb, .rpm, .tar.gz)
         run: packaging/linux/build-packages.sh "$(grep -m1 '^version' pialite-guard/Cargo.toml | cut -d'"' -f2)"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-packages
           path: dist/*
@@ -49,6 +49,7 @@ jobs:
           sudo pialite-guard status
           getent hosts example.com
           sudo pialite-guard test-dns
+          pialite-guard adapter-dns
       - name: Every built-in DNS provider answers (live)
         run: |
           for p in cloudflare adguard google quad9; do
@@ -72,7 +73,7 @@ jobs:
     name: Windows (build, tests, WFP, MSI install/uninstall)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -85,6 +86,10 @@ jobs:
         run: cargo build --release
       - name: Firewall self-test (real Windows Filtering Platform)
         run: .\target\release\pialite-guard.exe selftest-firewall
+      - name: DNS conflict check reads this machine's adapters
+        run: |
+          .\target\release\pialite-guard.exe adapter-dns
+          .\target\release\pialite-guard.exe adapter-dns --json
       - name: WiX Toolset
         run: |
           dotnet tool install --global wix --version 5.0.2
@@ -96,7 +101,7 @@ jobs:
           $v = (Select-String -Path pialite-guard\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           ./packaging/windows/build.ps1 -Version $v
           wix msi validate (Get-Item dist\*.msi).FullName
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-packages
           path: dist/*
@@ -125,7 +130,7 @@ jobs:
           if (Test-Path "$env:ProgramData\PiaLite") { Get-ChildItem "$env:ProgramData\PiaLite"; throw "data folder left behind" }
       - name: Installer logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-msi-logs
           path: "*.log"

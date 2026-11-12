@@ -42,14 +42,19 @@ Install and features:
       --features LIST                    guard,dns,hotel,autostart,hidepia (or none) - default: as before
       --dns PROVIDER                     nextdns | cloudflare | quad9 | adguard | google | custom
       --nextdns-id ID                    your NextDNS profile ID (with --dns nextdns)
-      --doh-url URL --doh-ips IP,IP      your own DoH server (with --dns custom)
+      --doh-url URL --doh-ips IP,IP      your own server (with --dns custom): https://... or tls://...
+      --doh-ca FILE                      its certificate authority (PEM), for a home server
       --mode off|startup|always          block mode (default: startup on a first install)
       --user ID                          account allowed to use the tray with the guard
       -i, --interactive                  ask the questions in this window
   pialite-guard teardown [--keep-config] (admin) remove the guard, its rules and settings; PIA put back
   pialite-guard features [--json]        what is installed
   pialite-guard dns-providers            the encrypted DNS providers to choose from
-  pialite-guard set-dns PROVIDER [NEXTDNS-ID | URL IPS]   (admin) switch the encrypted DNS provider
+  pialite-guard set-dns PROVIDER [NEXTDNS-ID | URL IPS [CA-FILE]]
+                                         (admin) switch the encrypted DNS provider; custom URL:
+                                         https://host[:port]/path or tls://host[:port] (e.g. a Pi-hole)
+  pialite-guard adapter-dns [--reset]    Windows: DNS set by hand on network adapters (it can bypass
+                                         PIA Lite); --reset (admin) sets them back to automatic
   pialite-guard check-update [--json]    is there a newer release on GitHub?
   pialite-guard apply-update             (admin) download, verify (signed) and install it
 Checks:
@@ -98,7 +103,10 @@ fn main() -> ExitCode {
         ["features"] => setup::features_report(false),
         ["features", "--json"] => setup::features_report(true),
         ["dns-providers"] => dns_providers(),
-        ["set-dns", rest @ ..] if !rest.is_empty() && rest.len() <= 3 => set_dns(rest),
+        ["adapter-dns"] => setup::adapter_dns(false, false),
+        ["adapter-dns", "--json"] => setup::adapter_dns(true, false),
+        ["adapter-dns", "--reset"] => setup::adapter_dns(false, true),
+        ["set-dns", rest @ ..] if !rest.is_empty() && rest.len() <= 4 => set_dns(rest),
         ["check-update"] => update::check(false),
         ["check-update", "--json"] => update::check(true),
         ["apply-update"] => update::apply(),
@@ -427,12 +435,22 @@ fn set_dns(rest: &[&str]) -> Result<(), String> {
             probe.set_provider("custom", Some((url, &list)))?; // checked before it is sent
             send(&format!("set_dns custom {url} {}", list.join(",")))
         }
+        ["custom", url, ips, ca_file] => {
+            let list: Vec<String> = ips.split(',').map(|s| s.trim().to_string()).collect();
+            let mut probe = config::Config::default();
+            probe.set_provider("custom", Some((url, &list)))?;
+            setup::install_ca_file(std::path::Path::new(ca_file))?;
+            send(&format!("set_dns custom {url} {} ca", list.join(",")))
+        }
         ["nextdns", id] => {
             set_profile(id, None)?;
             send("set_dns nextdns")
         }
         [p] if config::preset(p).is_some() => send(&format!("set_dns {p}")),
-        _ => Err(format!("usage: set-dns {} | set-dns nextdns ID | set-dns custom URL IP[,IP]", config::preset_ids())),
+        _ => Err(format!(
+            "usage: set-dns {} | set-dns nextdns ID | set-dns custom URL IP[,IP] [CA-FILE]\n  URL: https://host[:port]/path (DNS over HTTPS) or tls://host[:port] (DNS over TLS)\n  CA-FILE: the server's own certificate authority (PEM), e.g. a Pi-hole's",
+            config::preset_ids()
+        )),
     }
 }
 

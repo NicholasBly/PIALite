@@ -671,8 +671,10 @@ impl Guard {
                             Some(name) if s.pia.iter().any(|a| &a.name == name && a.up) => Tunnel::Up,
                             Some(_) => Tunnel::Down,
                         };
-                        // information only: is the adapter also where Windows routes NextDNS?
-                        let route = if v == Tunnel::Up {
+                        // information only: is the adapter also where Windows routes the DNS
+                        // provider? (not asked for a home server: it is on the LAN by design)
+                        let local_server = self.cfg().server_is_local();
+                        let route = if v == Tunnel::Up && !local_server {
                             let idx = s.pia.iter().find(|a| Some(&a.name) == w.adapter.as_ref()).map(|a| a.index);
                             crate::netif::route_index(probe).zip(idx).map(|(r, i)| r == i)
                         } else {
@@ -680,7 +682,7 @@ impl Guard {
                         };
                         if route != w.route_ok && route.is_some() {
                             notes.push(if route == Some(true) {
-                                "the route to the internet (NextDNS) goes through PIA's adapter".to_string()
+                                "the route to the encrypted DNS provider goes through PIA's adapter".to_string()
                             } else {
                                 "NOTE: encrypted DNS is NOT routed through PIA's adapter (split tunnel? another VPN?) - shown in the status"
                                     .to_string()
@@ -1326,16 +1328,26 @@ impl Guard {
     }
 
     /// Choose the encrypted DNS provider (admin). Takes effect at once.
-    pub fn set_dns(&self, provider: &str, custom: Option<(&str, &str)>) -> Result<String, String> {
+    /// `ca`: trust only the certificate authority already saved in
+    /// custom-ca.pem (put there by the admin's command / setup) for this server.
+    pub fn set_dns(&self, provider: &str, custom: Option<(&str, &str)>, ca: bool) -> Result<String, String> {
         let ips: Vec<String> =
             custom.map(|(_, ips)| ips.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
         let mut want = self.cfg();
         want.set_provider(provider, custom.map(|(url, _)| (url, ips.as_slice())))?; // checked before anything is saved
+        if ca {
+            let pem = std::fs::read(config::custom_ca_path()).map_err(|e| format!("the certificate file isn't in place: {e}"))?;
+            config::check_ca_pem(&pem)?;
+            want.doh_custom_ca = true;
+        }
         let _op = self.op_lock()?;
         self.update_cfg(|c| {
             c.dns_provider = want.dns_provider.clone();
             c.doh_host = want.doh_host.clone();
             c.doh_custom_path = want.doh_custom_path.clone();
+            c.doh_custom_dot = want.doh_custom_dot;
+            c.doh_custom_port = want.doh_custom_port;
+            c.doh_custom_ca = want.doh_custom_ca;
             c.doh_bootstrap = want.doh_bootstrap.clone();
         })?;
         self.proxy.set_resolver(resolver_for(&self.cfg()));
@@ -1524,8 +1536,9 @@ impl Guard {
                 Ok("ok".into())
             }
             ["seen", name] => need_admin().map(|_| if self.seen(name) { "yes" } else { "no" }.into()),
-            ["set_dns", provider] => need_admin().and_then(|_| self.set_dns(provider, None)),
-            ["set_dns", "custom", url, ips] => need_admin().and_then(|_| self.set_dns("custom", Some((url, ips)))),
+            ["set_dns", provider] => need_admin().and_then(|_| self.set_dns(provider, None, false)),
+            ["set_dns", "custom", url, ips] => need_admin().and_then(|_| self.set_dns("custom", Some((url, ips)), false)),
+            ["set_dns", "custom", url, ips, "ca"] => need_admin().and_then(|_| self.set_dns("custom", Some((url, ips)), true)),
             ["set_profile", id] => need_admin().and_then(|_| self.set_profile(id, None)),
             ["set_profile", id, dev] => need_admin().and_then(|_| self.set_profile(id, Some(dev))),
             ["set_users", sids] => need_admin().and_then(|_| self.set_users(sids.split(',').map(str::to_string).collect())),

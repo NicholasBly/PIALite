@@ -32,6 +32,7 @@ pub struct Options {
     pub nextdns_id: Option<String>,
     pub doh_url: Option<String>,
     pub doh_ips: Option<Vec<String>>,
+    pub doh_ca: Option<String>,
     pub mode: Option<BlockMode>,
     pub user: Option<String>,
     pub kind: Option<String>,
@@ -45,7 +46,7 @@ pub struct Options {
 /// something other than what was asked).
 pub fn parse_args(args: &[&str]) -> Result<Options, String> {
     const VALUED: &[&str] =
-        &["--features", "--dns", "--nextdns-id", "--doh-url", "--doh-ips", "--mode", "--user", "--kind", "--product-code"];
+        &["--features", "--dns", "--nextdns-id", "--doh-url", "--doh-ips", "--doh-ca", "--mode", "--user", "--kind", "--product-code"];
     let mut pairs: Vec<(String, Option<String>)> = vec![];
     let mut i = 0;
     while i < args.len() {
@@ -94,6 +95,7 @@ pub fn parse_args(args: &[&str]) -> Result<Options, String> {
                 o.nextdns_id = Some(v);
             }
             ("--doh-url", Some(v)) => o.doh_url = Some(v),
+            ("--doh-ca", Some(v)) => o.doh_ca = Some(v),
             ("--doh-ips", Some(v)) => o.doh_ips = Some(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()),
             ("--mode", Some(v)) => o.mode = Some(BlockMode::parse(&v).ok_or(format!("unknown block mode '{v}' (off, startup, always)"))?),
             ("--user", Some(v)) => o.user = Some(v),
@@ -156,9 +158,11 @@ pub fn apply_choices(cfg: &mut Config, o: &Options, features: &[String], fresh: 
     }
     if let Some(p) = &o.dns {
         if p == "custom" {
-            let url = o.doh_url.as_deref().ok_or("--dns custom needs --doh-url https://... and --doh-ips")?;
+            let url = o.doh_url.as_deref().ok_or("--dns custom needs --doh-url https://... (or tls://...) and --doh-ips")?;
             let ips = o.doh_ips.clone().unwrap_or_default();
             cfg.set_provider("custom", Some((url, &ips)))?;
+            // the CA file itself is copied by setup(); here only the choice
+            cfg.doh_custom_ca = o.doh_ca.is_some();
         } else {
             cfg.set_provider(p, None)?;
         }
@@ -370,11 +374,11 @@ fn interview(o: &mut Options, cfg: &Config, before: Option<&[String]>) {
         for p in config::DNS_PRESETS {
             println!("  {:<11} {}", p.id, p.name);
         }
-        println!("  {:<11} your own DNS-over-HTTPS server", "custom");
+        println!("  {:<11} your own server, e.g. a Pi-hole at home (DNS over HTTPS or TLS)", "custom");
         loop {
             let p = ask("  provider", cfg.provider()).to_lowercase();
             if p == "custom" {
-                o.doh_url = Some(ask("  DoH URL (https://...)", ""));
+                o.doh_url = Some(ask("  server (https://host/dns-query or tls://host)", ""));
                 o.doh_ips = Some(
                     ask("  its IP addresses (comma separated)", "")
                         .split(',')
@@ -382,6 +386,8 @@ fn interview(o: &mut Options, cfg: &Config, before: Option<&[String]>) {
                         .filter(|s| !s.is_empty())
                         .collect(),
                 );
+                let ca = ask("  its own certificate authority file (PEM; Enter = a public certificate)", "");
+                o.doh_ca = Some(ca).filter(|c| !c.is_empty());
             } else if config::preset(&p).is_none() {
                 println!("  unknown provider");
                 continue;
@@ -460,6 +466,9 @@ pub fn setup(mut o: Options) -> Result<(), String> {
             ensure_group(&mut rep);
         }
     }
+    if let Some(ca) = &o.doh_ca {
+        install_ca_file(Path::new(ca))?;
+    }
     config::save(&cfg)?;
     rep.ok(format!("settings saved: {}", describe(&cfg, &features)));
 
@@ -487,6 +496,9 @@ pub fn setup(mut o: Options) -> Result<(), String> {
     }
 
     hook_up_dns(&cfg, has(&features, "dns"), &mut rep);
+    if has(&features, "dns") {
+        check_dns_conflicts(&cfg, &mut rep);
+    }
 
     let tray = sibling("pialite-tray");
     match sys::set_tray_autostart(has(&features, "autostart"), &tray) {
@@ -624,6 +636,95 @@ fn hook_up_dns(cfg: &Config, dns: bool, rep: &mut Report) {
 
 pub const DNS_BACKUP: &str = "pia-dns-before.json";
 
+/// Things that would make lookups miss the guard, said plainly (setup never
+/// changes another program or an adapter by itself - except pausing the
+/// NextDNS app, as before; `adapter-dns --reset` is the user's choice).
+fn check_dns_conflicts(cfg: &Config, rep: &mut Report) {
+    if cfg.provider() == "custom" && cfg.server_is_local() {
+        match pia::read_settings() {
+            Ok(s) if !s.allow_lan => rep.warn(format!(
+                "your DNS server ({}) is on your home network, but PIA's 'Allow LAN' is off - while the VPN is connected PIA                  blocks it and lookups fail. Turn on Settings > Network > Allow LAN in PIA",
+                cfg.custom_url()
+            )),
+            _ => rep.ok(format!("home DNS server {} (reached over your network, encrypted)", cfg.custom_url())),
+        }
+    }
+    match sys::dns_setup() {
+        Ok(d) => {
+            let w = sys::dns_conflicts(&d);
+            if w.is_empty() {
+                rep.ok("no other DNS settings or programs found that would bypass PIA Lite");
+            }
+            for x in w {
+                rep.warn(x);
+            }
+        }
+        Err(e) => rep.warn(format!("could not check the network adapters' DNS settings: {e}")),
+    }
+}
+
+/// `adapter-dns [--json] [--reset]`
+pub fn adapter_dns(json: bool, reset: bool) -> Result<(), String> {
+    let d = sys::dns_setup()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&d).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    if cfg!(windows) {
+        println!("Network adapters (connected, not PIA's):");
+        for a in &d.adapters {
+            let servers: Vec<&str> = a.v4.iter().chain(a.v6.iter()).map(String::as_str).collect();
+            println!(
+                "  {:<24} {}{}",
+                a.alias,
+                if a.manual() { format!("set by hand: {}", servers.join(", ")) } else { "automatic (DHCP)".into() },
+                if a.doh && a.manual() { " + Windows DNS over HTTPS" } else { "" }
+            );
+        }
+    }
+    println!("DNS port 53 held by: {}", if d.port53.is_empty() { "nothing".into() } else { d.port53.join(", ") });
+    if !d.dns_apps.is_empty() {
+        println!("DNS programs: {}", d.dns_apps.join(", "));
+    }
+    let w = sys::dns_conflicts(&d);
+    if w.is_empty() {
+        println!("Nothing found that would bypass PIA Lite's encrypted DNS.");
+    }
+    for x in &w {
+        println!("NOTE: {x}");
+    }
+    if reset {
+        if !cfg!(windows) {
+            return Err("--reset is for Windows adapters".into());
+        }
+        if !sys::is_admin() {
+            return Err("--reset needs an administrator".into());
+        }
+        sys::protect_data_dir()?;
+        let done = sys::reset_adapter_dns(&d)?;
+        if done.is_empty() {
+            println!("No adapter has DNS set by hand - nothing to reset.");
+        } else {
+            println!("Set back to automatic: {} (the old settings are saved and come back if PIA Lite is removed)", done.join(", "));
+        }
+    }
+    Ok(())
+}
+
+/// Copy a home server's certificate authority (PEM) into the admin-only data
+/// folder, where the guard reads it. Checked first.
+pub fn install_ca_file(src: &Path) -> Result<(), String> {
+    let pem = std::fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let n = config::check_ca_pem(&pem)?;
+    let dst = config::custom_ca_path();
+    let tmp = dst.with_extension("tmp");
+    std::fs::write(&tmp, &pem)
+        .and_then(|_| std::fs::rename(&tmp, &dst))
+        .map_err(|e| format!("{}: {e} (run as administrator / root)", dst.display()))?;
+    println!("  ok  certificate authority saved ({n} certificate(s)) - only it is trusted for your server");
+    Ok(())
+}
+
 fn test_provider(cfg: &Config) -> Result<(), String> {
     use crate::doh::Resolve;
     let d = crate::doh::Doh::from_config(cfg)?;
@@ -760,6 +861,11 @@ pub fn teardown(keep_config: bool) -> Result<(), String> {
     }
     // 3. PIA as it was: DNS, kill switch (an unfinished hotel login), NextDNS app, startup task
     restore_pia_dns(&mut rep);
+    match sys::restore_adapter_dns() {
+        Ok(done) if !done.is_empty() => rep.ok(format!("DNS set by hand put back on: {}", done.join(", "))),
+        Ok(_) => {}
+        Err(e) => rep.warn(format!("could not put the adapters' own DNS settings back: {e}")),
+    }
     resume_nextdns_app(&mut rep);
     let cfg = config::load(|| false).config().clone();
     let saved = match config::load_recovery() {
@@ -862,6 +968,26 @@ mod tests {
     }
 
     #[test]
+    fn dns_conflicts_are_found_and_explained() {
+        // what PowerShell writes for one Wi-Fi adapter with NextDNS typed in (+ DoH), YogaDNS running
+        let one = r#"{"adapters":{"alias":"Wi-Fi","index":12,"description":"Intel Wi-Fi","v4":"45.90.28.0","v6":[],"doh":true},"port53":"127.0.0.1|YogaDNS","dns_apps":"YogaDNS|YogaDNS Service|Running","resolved_dot":false}"#;
+        let d = sys::parse_dns_setup(one).unwrap();
+        assert_eq!(d.adapters.len(), 1);
+        assert_eq!(d.adapters[0].v4, vec!["45.90.28.0"]);
+        let w = sys::dns_conflicts(&d);
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w[0].contains("'Wi-Fi' has DNS set by hand (45.90.28.0) with Windows' own DNS over HTTPS"));
+        assert!(w[1].contains("port 53") && w[1].contains("YogaDNS"));
+        assert!(w[2].starts_with("YogaDNS Service is running"));
+        // automatic DNS, the guard on port 53, the NextDNS app paused: nothing to say
+        let fine = r#"{"adapters":[{"alias":"Ethernet","index":3,"description":"x","v4":[],"v6":[],"doh":false}],"port53":["127.0.0.1|pialite-guard"],"dns_apps":["NextDNS|NextDNS|Stopped"],"resolved_dot":false}"#;
+        assert!(sys::dns_conflicts(&sys::parse_dns_setup(fine).unwrap()).is_empty());
+        let empty = r#"{"adapters":[],"port53":[],"dns_apps":[],"resolved_dot":true}"#;
+        assert!(sys::dns_conflicts(&sys::parse_dns_setup(empty).unwrap())[0].contains("systemd-resolved"));
+        assert!(sys::parse_dns_setup("nope").is_err());
+    }
+
+    #[test]
     fn arguments() {
         let o = parse_args(&["--features", "guard,dns", "--dns", "quad9", "--mode", "always", "--kind", "msi", "--user", "1000"]).unwrap();
         assert_eq!(o.features, Some(s(&["guard", "dns"])));
@@ -885,6 +1011,8 @@ mod tests {
         assert_eq!(m.kind.as_deref(), Some("msi"));
         assert_eq!(m.product_code.as_deref(), Some("{ABC}"));
         assert!(parse_args(&["--kind=zip"]).is_err());
+        let h = parse_args(&["--dns", "custom", "--doh-url", "tls://pi.hole", "--doh-ips", "192.168.1.2", "--doh-ca", "ca.pem"]).unwrap();
+        assert_eq!((h.doh_url.as_deref(), h.doh_ca.as_deref()), (Some("tls://pi.hole"), Some("ca.pem")));
         assert!(parse_args(&["--features", "guard,dsn"]).unwrap_err().contains("unknown feature 'dsn'"), "a typo is refused");
         assert!(parse_args(&["--dns", "opendns"]).is_err());
         assert!(parse_args(&["--mode"]).is_err(), "a missing value");

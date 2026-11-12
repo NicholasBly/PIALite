@@ -119,7 +119,7 @@ Whatever you pick is written to an install record, so **updates install the same
 | **AdGuard** | blocks ads and trackers | `dns.adguard-dns.com` |
 | **Google** | Google Public DNS | `dns.google` |
 | **NextDNS** | your own filter lists, logs and parental controls (needs a free/paid NextDNS profile ID) | `dns.nextdns.io/<your id>` |
-| **Custom** | any DNS-over-HTTPS server (command line: `set-dns custom https://host/dns-query IP[,IP]`) | yours |
+| **Custom** | your own server - e.g. a **Pi-hole at home** ([guide](docs/PIHOLE.md)) - over HTTPS or TLS, with its own certificate authority if it has one | `set-dns custom tls://pi.hole IP [CA-FILE]` |
 
 The guard connects to the provider by IP address (no plain-DNS lookup ever happens to find it) and checks its TLS
 certificate. Lookups go over HTTPS (DoH), or over TLS on port 853 (DoT) for Quad9. Switch any time: `pialite-guard set-dns cloudflare` (admin), or the features window.
@@ -128,6 +128,11 @@ certificate. Lookups go over HTTPS (DoH), or over TLS on port 853 (DoT) for Quad
   on uninstall. If the NextDNS Windows app is installed, it is paused (not removed) so two DNS programs don't fight.
 - **Linux:** the guard redirects every program's plain DNS (port 53) to itself with an nftables rule - whatever
   your distribution uses for DNS (systemd-resolved, NetworkManager, resolv.conf). PIA's own lookups are left alone.
+- **Conflicts are reported, not hidden.** Setup (and `pialite-guard adapter-dns`) checks for things that would let
+  lookups skip PIA Lite: DNS typed in by hand on a Windows network adapter (for example NextDNS with Windows' own
+  "DNS over HTTPS" ticked - Windows may ask those servers too), other DNS programs (YogaDNS, dnscrypt-proxy,
+  AdGuard...), and anything else holding port 53. `pialite-guard adapter-dns --reset` sets typed-in adapter DNS back
+  to automatic; uninstalling PIA Lite puts it back as it was.
 
 ## Kill switch modes
 
@@ -218,6 +223,7 @@ pialite-guard hotel start            hotel Wi-Fi login (VPN off for a few minute
 pialite-guard features               what is installed
 pialite-guard setup -i               (admin) choose features again, asking in the terminal
 pialite-guard set-dns quad9          (admin) switch the encrypted DNS provider
+pialite-guard adapter-dns            DNS settings / programs that could bypass PIA Lite
 pialite-guard test-dns               (admin) prove lookups go through the guard, encrypted
 pialite-guard show-rules             (admin) every firewall rule, checked against the plan
 pialite-guard unlock                 (admin) emergency: block off
@@ -275,8 +281,8 @@ The Windows release test kit is in [tests/windows](tests/windows) and [docs/RELE
 
 ## Security
 
-Please report vulnerabilities privately - see [SECURITY.md](SECURITY.md). Design notes and the full history of
-independent reviews and fixes: [docs/DESIGN.txt](docs/DESIGN.txt), [docs/AUDIT-RESPONSE.txt](docs/AUDIT-RESPONSE.txt).
+Please report vulnerabilities privately - see [SECURITY.md](SECURITY.md). Design notes:
+[docs/DESIGN.txt](docs/DESIGN.txt).
 
 ## Contributing
 

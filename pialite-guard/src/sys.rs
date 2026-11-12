@@ -465,3 +465,242 @@ pub fn autostart_entry(tray_exe: &Path) -> String {
 pub fn exe_dir() -> PathBuf {
     std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."))
 }
+
+// ------------------------------------------------------------- DNS conflicts
+//
+// PIA Lite's encrypted DNS only sees lookups that reach it. Three things can
+// take lookups elsewhere: DNS set by hand on a network adapter (Windows, e.g.
+// NextDNS typed into Settings with "DNS over HTTPS" on - Windows may ask those
+// servers too), another DNS program (YogaDNS, the NextDNS app, dnscrypt-proxy,
+// AdGuard...), or a program already holding port 53. Found, they are reported.
+
+/// What `adapter-dns` and setup look at.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DnsSetup {
+    pub adapters: Vec<AdapterDns>,
+    /// "address|program" holding UDP port 53
+    pub port53: Vec<String>,
+    /// "name|display name|state" of DNS programs found
+    pub dns_apps: Vec<String>,
+    /// Linux: systemd-resolved sends DNS over TLS itself (port 853, not redirected)
+    pub resolved_dot: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdapterDns {
+    pub alias: String,
+    pub index: u32,
+    pub description: String,
+    /// DNS servers typed in by hand (empty = automatic / DHCP)
+    pub v4: Vec<String>,
+    pub v6: Vec<String>,
+    /// Windows' "DNS over HTTPS" settings exist for this adapter
+    pub doh: bool,
+}
+
+impl AdapterDns {
+    pub fn manual(&self) -> bool {
+        !self.v4.is_empty() || !self.v6.is_empty()
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const ADAPTER_BACKUP: &str = "adapter-dns-before.json";
+
+/// Known DNS programs that take over a computer's DNS (service / process names).
+pub const DNS_APP_PATTERN: &str =
+    "yogadns|nextdns|dnscrypt|acrylic|adguard|portmaster|technitium|dnsproxy|simplednscrypt|unbound|stubby|cloudflared";
+
+#[cfg(windows)]
+const DNS_SETUP_PS: &str = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$pat = '__PATTERN__'
+$ad = @(foreach ($a in (Get-NetAdapter | Where-Object { $_.Status -eq 'Up' })) {
+  if ($a.Name -like 'wgpia*' -or $a.InterfaceDescription -match 'Private Internet Access|WireGuard|TAP-Windows|Wintun') { continue }
+  $g = $a.InterfaceGuid
+  $n4 = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$g").NameServer
+  $n6 = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$g").NameServer
+  [pscustomobject]@{
+    alias = [string]$a.Name; index = [uint32]$a.ifIndex; description = [string]$a.InterfaceDescription
+    v4 = @(([string]$n4) -split '[ ,]+' | Where-Object { $_ })
+    v6 = @(([string]$n6) -split '[ ,]+' | Where-Object { $_ })
+    doh = [bool](Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters\$g\DohInterfaceSettings")
+  }
+})
+$p53 = @(Get-NetUDPEndpoint -LocalPort 53 | ForEach-Object { $p = Get-Process -Id $_.OwningProcess; "$($_.LocalAddress)|$($p.ProcessName)" } | Sort-Object -Unique)
+$apps = @(Get-Service | Where-Object { $_.Name -match $pat -or $_.DisplayName -match $pat } | ForEach-Object { "$($_.Name)|$($_.DisplayName)|$($_.Status)" })
+$apps += @(Get-Process | Where-Object { $_.ProcessName -match $pat } | ForEach-Object { "$($_.ProcessName)|(program)|Running" } | Sort-Object -Unique)
+[pscustomobject]@{ adapters = $ad; port53 = $p53; dns_apps = $apps; resolved_dot = $false } | ConvertTo-Json -Depth 4 -Compress
+"#;
+
+#[cfg(windows)]
+fn powershell(script: &str) -> Result<String, String> {
+    // -EncodedCommand: UTF-16LE + base64 - no quoting problems
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let mut enc = String::new();
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            enc.push(if i <= c.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    let (ok, out) = run("powershell.exe", &["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &enc])?;
+    if ok {
+        Ok(out)
+    } else {
+        Err(out.lines().find(|l| !l.trim().is_empty()).unwrap_or("PowerShell failed").trim().to_string())
+    }
+}
+
+/// The DNS settings that can make lookups miss the guard.
+#[cfg(windows)]
+pub fn dns_setup() -> Result<DnsSetup, String> {
+    let out = powershell(&DNS_SETUP_PS.replace("__PATTERN__", DNS_APP_PATTERN))?;
+    let json = out.lines().rev().find(|l| l.trim_start().starts_with('{')).ok_or("no answer from PowerShell")?;
+    parse_dns_setup(json)
+}
+
+/// PowerShell's JSON for dns_setup (ConvertTo-Json writes a one-item array as
+/// the item itself, and a one-address list as a string).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn parse_dns_setup(json: &str) -> Result<DnsSetup, String> {
+    let mut v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("unreadable DNS report: {e}"))?;
+    for k in ["adapters", "port53", "dns_apps"] {
+        if !v[k].is_array() && !v[k].is_null() {
+            v[k] = serde_json::Value::Array(vec![v[k].take()]);
+        }
+    }
+    for a in v["adapters"].as_array_mut().into_iter().flatten() {
+        for k in ["v4", "v6"] {
+            if a[k].is_string() {
+                a[k] = serde_json::Value::Array(vec![a[k].take()]);
+            }
+        }
+    }
+    serde_json::from_value(v).map_err(|e| format!("unreadable DNS report: {e}"))
+}
+
+#[cfg(not(windows))]
+pub fn dns_setup() -> Result<DnsSetup, String> {
+    let mut d = DnsSetup::default();
+    if let Ok((_, out)) = run("ss", &["-H", "-lunp", "sport = :53"]) {
+        d.port53 = out
+            .lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                let addr = f.get(3)?;
+                let prog = l.split("((\"").nth(1).and_then(|p| p.split('"').next()).unwrap_or("?");
+                Some(format!("{addr}|{prog}"))
+            })
+            .collect();
+    }
+    if let Ok((_, out)) = run("resolvectl", &["status"]) {
+        d.resolved_dot = out.contains("+DNSOverTLS");
+    }
+    Ok(d)
+}
+
+/// Plain-language warnings for setup / adapter-dns (the guard's own proxy
+/// on port 53 and the paused NextDNS app are not conflicts).
+pub fn dns_conflicts(d: &DnsSetup) -> Vec<String> {
+    let mut w = vec![];
+    for a in d.adapters.iter().filter(|a| a.manual()) {
+        let servers: Vec<&str> = a.v4.iter().chain(a.v6.iter()).map(String::as_str).collect();
+        w.push(format!(
+            "'{}' has DNS set by hand ({}){} - Windows may send some lookups there instead of through PIA Lite. \
+             Set it to Automatic (DHCP) in Settings > Network, or run: pialite-guard adapter-dns --reset",
+            a.alias,
+            servers.join(", "),
+            if a.doh { " with Windows' own DNS over HTTPS" } else { "" }
+        ));
+    }
+    let re = DNS_APP_PATTERN.split('|').collect::<Vec<_>>();
+    for p in &d.port53 {
+        let prog = p.rsplit('|').next().unwrap_or("").to_lowercase();
+        if !prog.contains("pialite") && !prog.is_empty() && prog != "systemd-resolve" && prog != "systemd-resolved" {
+            w.push(format!("another program holds DNS port 53 ({p}) - the guard's DNS proxy can't start while it does"));
+        }
+    }
+    for app in &d.dns_apps {
+        let mut f = app.split('|');
+        let (name, display, state) = (f.next().unwrap_or(""), f.next().unwrap_or(""), f.next().unwrap_or(""));
+        let lname = name.to_lowercase();
+        if lname.contains("nextdns") && !state.eq_ignore_ascii_case("running") {
+            continue; // paused by setup
+        }
+        if !state.eq_ignore_ascii_case("running") || !re.iter().any(|r| lname.contains(r) || display.to_lowercase().contains(r)) {
+            continue;
+        }
+        let who = if display.is_empty() || display == "(program)" { name } else { display };
+        w.push(format!(
+            "{who} is running - it handles DNS too, and two DNS programs fight. Turn it off while PIA Lite's encrypted DNS \
+             is on (or keep it and install PIA Lite without 'Encrypted DNS')"
+        ));
+    }
+    if d.resolved_dot {
+        w.push("systemd-resolved sends DNS over TLS itself - those lookups bypass PIA Lite (set DNSOverTLS=no)".into());
+    }
+    w
+}
+
+/// Windows: set hand-typed adapter DNS back to automatic; the old values are
+/// saved (and put back by teardown).
+#[cfg(windows)]
+pub fn reset_adapter_dns(d: &DnsSetup) -> Result<Vec<String>, String> {
+    let manual: Vec<&AdapterDns> = d.adapters.iter().filter(|a| a.manual()).collect();
+    if manual.is_empty() {
+        return Ok(vec![]);
+    }
+    let backup = config::data_dir().join(ADAPTER_BACKUP);
+    let mut saved: Vec<AdapterDns> = std::fs::read_to_string(&backup).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    for a in &manual {
+        if !saved.iter().any(|s| s.alias == a.alias) {
+            saved.push((*a).clone());
+        }
+    }
+    std::fs::write(&backup, serde_json::to_string_pretty(&saved).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("{}: {e}", backup.display()))?;
+    let mut done = vec![];
+    for a in manual {
+        powershell(&format!("Set-DnsClientServerAddress -InterfaceIndex {} -ResetServerAddresses -ErrorAction Stop", a.index))?;
+        done.push(a.alias.clone());
+    }
+    Ok(done)
+}
+
+/// Teardown: the adapter DNS set back to what it was before `--reset`.
+#[cfg(windows)]
+pub fn restore_adapter_dns() -> Result<Vec<String>, String> {
+    let backup = config::data_dir().join(ADAPTER_BACKUP);
+    let Ok(text) = std::fs::read_to_string(&backup) else { return Ok(vec![]) };
+    let saved: Vec<AdapterDns> = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", backup.display()))?;
+    let ok_ip = |s: &String| s.parse::<std::net::IpAddr>().is_ok();
+    let mut done = vec![];
+    for a in saved {
+        let servers: Vec<String> = a.v4.iter().chain(a.v6.iter()).filter(|s| ok_ip(s)).map(|s| format!("'{s}'")).collect();
+        if servers.is_empty() || a.alias.contains('\'') {
+            continue;
+        }
+        powershell(&format!(
+            "Set-DnsClientServerAddress -InterfaceAlias '{}' -ServerAddresses @({}) -ErrorAction Stop",
+            a.alias,
+            servers.join(",")
+        ))?;
+        done.push(a.alias);
+    }
+    let _ = std::fs::remove_file(&backup);
+    Ok(done)
+}
+
+#[cfg(not(windows))]
+pub fn reset_adapter_dns(_d: &DnsSetup) -> Result<Vec<String>, String> {
+    Ok(vec![])
+}
+
+#[cfg(not(windows))]
+pub fn restore_adapter_dns() -> Result<Vec<String>, String> {
+    Ok(vec![])
+}

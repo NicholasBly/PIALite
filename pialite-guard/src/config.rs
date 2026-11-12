@@ -48,6 +48,13 @@ pub struct Config {
     pub dns_provider: String,
     /// URL path for the "custom" provider (e.g. /dns-query).
     pub doh_custom_path: String,
+    /// custom server: DNS over TLS (tls://host) instead of HTTPS
+    pub doh_custom_dot: bool,
+    /// custom server: its port (0 = 443 for HTTPS, 853 for TLS)
+    pub doh_custom_port: u16,
+    /// custom server: trust only the certificate authority in
+    /// <data folder>/custom-ca.pem (a home server such as Pi-hole with its own CA)
+    pub doh_custom_ca: bool,
 }
 
 /// What this installation uses, chosen in the installer (0.9).
@@ -143,6 +150,9 @@ impl Default for Config {
             features: None,
             dns_provider: "nextdns".into(),
             doh_custom_path: String::new(),
+            doh_custom_dot: false,
+            doh_custom_port: 0,
+            doh_custom_ca: false,
         }
     }
 }
@@ -168,18 +178,24 @@ impl Config {
     pub fn set_provider(&mut self, id: &str, custom: Option<(&str, &[String])>) -> Result<(), String> {
         if id == "custom" {
             let (url, ips) = custom.ok_or("custom DNS needs a URL and its IP addresses")?;
-            let (host, path) = parse_doh_url(url)?;
+            let u = parse_server_url(url)?;
             if ips.is_empty() || ips.iter().any(|ip| ip.parse::<std::net::IpAddr>().is_err()) {
                 return Err("custom DNS needs at least one valid IP address for the server (it is never looked up by name)".into());
             }
-            self.doh_host = host;
-            self.doh_custom_path = path;
+            self.doh_host = u.host;
+            self.doh_custom_path = u.path;
+            self.doh_custom_dot = u.dot;
+            self.doh_custom_port = u.port;
+            self.doh_custom_ca = false; // the caller turns it on with the file in place
             self.doh_bootstrap = ips.to_vec();
         } else {
             let p = preset(id).ok_or_else(|| format!("unknown DNS provider '{id}' (use: {}, custom)", preset_ids()))?;
             self.doh_host = p.host.into();
             self.doh_bootstrap = p.bootstrap.iter().map(|s| s.to_string()).collect();
             self.doh_custom_path.clear();
+            self.doh_custom_dot = false;
+            self.doh_custom_port = 0;
+            self.doh_custom_ca = false;
         }
         self.dns_provider = id.into();
         Ok(())
@@ -189,7 +205,34 @@ impl Config {
     /// and dashes; other presets: their path; custom: the path given.
     /// DNS over TLS for this provider (see DnsPreset::dot)?
     pub fn dot(&self) -> bool {
+        if self.provider() == "custom" {
+            return self.doh_custom_dot;
+        }
         preset(self.provider()).is_some_and(|p| p.dot)
+    }
+
+    /// The server's port: a custom one if given, else 853 (TLS) / 443 (HTTPS).
+    pub fn port(&self) -> u16 {
+        match (self.provider() == "custom" && self.doh_custom_port != 0, self.dot()) {
+            (true, _) => self.doh_custom_port,
+            (false, true) => 853,
+            (false, false) => 443,
+        }
+    }
+
+    /// The custom server as typed (tls://host[:port] or https://host[:port]/path).
+    pub fn custom_url(&self) -> String {
+        let port = if self.doh_custom_port != 0 { format!(":{}", self.doh_custom_port) } else { String::new() };
+        if self.doh_custom_dot {
+            format!("tls://{}{port}", self.doh_host)
+        } else {
+            format!("https://{}{port}{}", self.doh_host, self.doh_custom_path)
+        }
+    }
+
+    /// Every server address is on the local network (a home DNS server).
+    pub fn server_is_local(&self) -> bool {
+        !self.doh_bootstrap.is_empty() && self.doh_bootstrap.iter().all(|ip| ip.parse::<std::net::IpAddr>().is_ok_and(is_local_ip))
     }
 
     pub fn doh_path(&self) -> String {
@@ -227,9 +270,7 @@ impl Config {
         if !self.dns_provider.is_empty() && self.dns_provider != "custom" && preset(&self.dns_provider).is_none() {
             return Err(format!("dns_provider '{}' is not known", self.dns_provider));
         }
-        if self.dns_provider == "custom"
-            && (parse_doh_url(&format!("https://{}{}", self.doh_host, self.doh_custom_path)).is_err() || self.doh_bootstrap.is_empty())
-        {
+        if self.dns_provider == "custom" && (parse_server_url(&self.custom_url()).is_err() || self.doh_bootstrap.is_empty()) {
             return Err("custom DNS provider: invalid host/path or no IP address".into());
         }
         if self.doh_bootstrap.iter().any(|ip| ip.parse::<std::net::IpAddr>().is_err()) {
@@ -249,13 +290,37 @@ pub fn preset_ids() -> String {
 
 /// https://host[:443]/path -> (host, path). Only https, a plain host name
 /// (letters, digits, dots, dashes) and a path without spaces or quotes.
-pub fn parse_doh_url(url: &str) -> Result<(String, String), String> {
-    let rest = url.strip_prefix("https://").ok_or("the DNS URL must start with https://")?;
-    let (host, path) = match rest.find('/') {
+/// A custom encrypted DNS server: `https://host[:port][/path]` (DNS over
+/// HTTPS, path defaults to /dns-query) or `tls://host[:port]` (DNS over TLS).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerUrl {
+    pub host: String,
+    pub path: String,
+    /// 0 = the default (443 / 853)
+    pub port: u16,
+    pub dot: bool,
+}
+
+pub fn parse_server_url(url: &str) -> Result<ServerUrl, String> {
+    let (dot, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (false, r)
+    } else if let Some(r) = url.strip_prefix("tls://") {
+        (true, r)
+    } else {
+        return Err("the server must start with https:// (DNS over HTTPS) or tls:// (DNS over TLS)".into());
+    };
+    let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/dns-query"),
     };
-    let host = host.strip_suffix(":443").unwrap_or(host);
+    if dot && path != "/dns-query" && path != "/" {
+        return Err("a tls:// server has no path".into());
+    }
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok().filter(|p| *p != 0).ok_or(format!("'{p}' is not a port number"))?),
+        None => (hostport, 0),
+    };
+    let port = if (!dot && port == 443) || (dot && port == 853) { 0 } else { port };
     let ok_host = !host.is_empty()
         && host.len() <= 253
         && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
@@ -267,7 +332,36 @@ pub fn parse_doh_url(url: &str) -> Result<(String, String), String> {
     if path.len() > 200 || path.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '\\') {
         return Err("the DNS URL path has characters that aren't allowed".into());
     }
-    Ok((host.to_ascii_lowercase(), path.to_string()))
+    Ok(ServerUrl { host: host.to_ascii_lowercase(), path: if dot { String::new() } else { path.to_string() }, port, dot })
+}
+
+/// Private / link-local / unique-local addresses (a server at home).
+pub fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(a) => a.is_private() || a.is_link_local() || a.is_loopback(),
+        std::net::IpAddr::V6(a) => (a.segments()[0] & 0xfe00) == 0xfc00 || (a.segments()[0] & 0xffc0) == 0xfe80 || a.is_loopback(),
+    }
+}
+
+/// The file with a custom server's certificate authority (PEM).
+pub fn custom_ca_path() -> PathBuf {
+    data_dir().join("custom-ca.pem")
+}
+
+/// Check a PEM file holds at least one certificate (and nothing huge).
+pub fn check_ca_pem(pem: &[u8]) -> Result<usize, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    if pem.len() > 64 * 1024 {
+        return Err("the certificate file is too big (over 64 KB)".into());
+    }
+    let certs: Vec<_> =
+        CertificateDer::pem_slice_iter(pem).collect::<Result<_, _>>().map_err(|e| format!("not a PEM certificate file: {e:?}"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, _) = roots.add_parsable_certificates(certs);
+    if added == 0 {
+        return Err("no usable certificate in that file (it must be PEM: -----BEGIN CERTIFICATE-----)".into());
+    }
+    Ok(added)
 }
 
 pub fn valid_profile(id: &str) -> bool {
@@ -709,7 +803,31 @@ pub mod tests {
         assert!(c.set_provider("custom", Some(("http://doh.example.net/q", &ips))).is_err(), "https only");
         assert!(c.set_provider("custom", Some(("https://bad host/q", &ips))).is_err());
         assert!(c.set_provider("custom", Some(("https://doh.example.net/a b", &ips))).is_err());
-        assert_eq!(parse_doh_url("https://Doh.Example.net:443").unwrap(), ("doh.example.net".into(), "/dns-query".into()));
+        let u = parse_server_url("https://Doh.Example.net:443").unwrap();
+        assert_eq!((u.host.as_str(), u.path.as_str(), u.port, u.dot), ("doh.example.net", "/dns-query", 0, false));
+        // a home server (Pi-hole behind dnsdist): DNS over TLS, own port, LAN address
+        let u = parse_server_url("tls://pi.hole").unwrap();
+        assert_eq!((u.host.as_str(), u.port, u.dot), ("pi.hole", 0, true));
+        assert_eq!(parse_server_url("tls://pi.hole:8853").unwrap().port, 8853);
+        assert_eq!(parse_server_url("tls://pi.hole:853").unwrap().port, 0, "the default port is stored as 0");
+        assert_eq!(parse_server_url("https://pi.hole:8443/dns-query").unwrap().port, 8443);
+        assert!(parse_server_url("tls://pi.hole/dns-query/x").is_err(), "tls:// has no path");
+        assert!(parse_server_url("tls://pi.hole:0").is_err() && parse_server_url("tls://pi.hole:99999").is_err());
+        assert!(parse_server_url("dot://pi.hole").is_err());
+        let lan = vec!["192.168.1.2".to_string()];
+        c.set_provider("custom", Some(("tls://pi.hole", &lan))).unwrap();
+        assert!(c.dot() && c.port() == 853 && c.server_is_local() && c.custom_url() == "tls://pi.hole");
+        assert!(c.clone().validate().is_ok());
+        c.set_provider("custom", Some(("https://pi.hole:8443/dns-query", &lan))).unwrap();
+        assert!(!c.dot() && c.port() == 8443 && c.custom_url() == "https://pi.hole:8443/dns-query");
+        c.set_provider("custom", Some(("https://doh.example.net/q", &ips))).unwrap();
+        assert!(!c.server_is_local() && c.port() == 443);
+        c.doh_custom_ca = true;
+        c.set_provider("quad9", None).unwrap();
+        assert!(!c.doh_custom_ca && c.dot() && c.port() == 853, "a preset forgets the custom server's settings");
+        assert!(
+            is_local_ip("fd00::1".parse().unwrap()) && is_local_ip("10.1.2.3".parse().unwrap()) && !is_local_ip("9.9.9.9".parse().unwrap())
+        );
         // a file naming an unknown provider is damaged (falls back like any damaged file)
         let bad: Config = serde_json::from_str(r#"{"dns_provider":"evil"}"#).unwrap();
         assert!(bad.validate().is_err());
@@ -717,8 +835,8 @@ pub mod tests {
 
     #[test]
     fn doh_path_and_validation() {
-        let mut c = Config { profile_id: "ab12cd".into(), device_name: "Kev's Laptop!".into(), ..Default::default() };
-        assert_eq!(c.doh_path(), "/ab12cd/Kev-s-Laptop");
+        let mut c = Config { profile_id: "ab12cd".into(), device_name: "Sam's Laptop!".into(), ..Default::default() };
+        assert_eq!(c.doh_path(), "/ab12cd/Sam-s-Laptop");
         c.device_name.clear();
         assert_eq!(c.doh_path(), "/ab12cd");
         assert!(valid_sid("S-1-5-21-111-222-333-1001"));

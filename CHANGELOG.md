@@ -2,10 +2,27 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.1] - 2026-11-11
+
+### Added
+- **Your own DNS server, e.g. a Pi-hole at home**, encrypted: custom servers can now be `tls://host[:port]`
+  (DNS over TLS) as well as `https://host[:port]/path`, and can be trusted through their own certificate
+  authority (`set-dns custom tls://pi.hole IP CA-FILE`, `setup --doh-ca FILE`). Guide: `docs/PIHOLE.md`.
+- **DNS conflict check** in setup and `pialite-guard adapter-dns`: DNS typed in by hand on Windows network
+  adapters (incl. Windows' own DNS over HTTPS), other DNS programs (YogaDNS, dnscrypt-proxy, AdGuard, ...),
+  anything holding port 53, systemd-resolved's own DNS over TLS. `adapter-dns --reset` sets adapters back to
+  automatic (put back on uninstall).
+- Setup warns when a home DNS server can't be reached while connected because PIA's "Allow LAN" is off.
+- `tools/dns-report.ps1` (Windows) and `tools/pihole-report.sh` (Pi-hole): read-only reports of a DNS setup.
+
+### Changed
+- The "is DNS routed through the VPN" note is skipped for a server on your own network (it never is, by design).
+- GitHub Actions updated (checkout v7, upload-artifact v7, download-artifact v8).
+
 ## [0.9.0] - 2026-11-09
 
 First public release. Earlier versions (0.1 - 0.6.5) were private builds for one PC, installed with
-PowerShell scripts; they went through ten rounds of independent review (see `docs/AUDIT-RESPONSE.txt`).
+PowerShell scripts; they went through ten rounds of independent review.
 
 ### Added
 - **Choose your features.** The kill switch (network guard), encrypted DNS and the hotel Wi-Fi login are each

@@ -245,10 +245,13 @@ impl Doh {
     /// From the config's bootstrap IP list (port 443, or 853 for DNS over TLS).
     pub fn from_config(cfg: &crate::config::Config) -> Result<Self, String> {
         let dot = cfg.dot();
-        let port = if dot { 853 } else { 443 };
+        let port = cfg.port();
         let addrs =
             cfg.doh_bootstrap.iter().filter_map(|ip| ip.parse::<std::net::IpAddr>().ok()).map(|ip| SocketAddr::new(ip, port)).collect();
-        let tls = if dot { tls_config_alpn(public_roots(), &[b"dot"]) } else { tls_config(public_roots()) };
+        // a custom server with its own certificate authority trusts ONLY that
+        let roots =
+            if cfg.provider() == "custom" && cfg.doh_custom_ca { custom_roots(&crate::config::custom_ca_path())? } else { public_roots() };
+        let tls = if dot { tls_config_alpn(roots, &[b"dot"]) } else { tls_config(roots) };
         Ok(Doh::new(tls, &cfg.doh_host, &cfg.doh_path(), addrs)?.with_dot(dot))
     }
 
@@ -299,6 +302,16 @@ impl Doh {
         validate(&reply, query)?;
         Ok(reply)
     }
+}
+
+/// The certificate authorities in a PEM file (a home server's own CA).
+pub fn custom_roots(path: &std::path::Path) -> Result<rustls::RootCertStore, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    let pem = std::fs::read(path).map_err(|e| format!("the DNS server's certificate file {}: {e}", path.display()))?;
+    crate::config::check_ca_pem(&pem)?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(CertificateDer::pem_slice_iter(&pem).filter_map(Result::ok));
+    Ok(roots)
 }
 
 /// One DNS-over-TLS round trip: 2-byte length + query, 2-byte length + answer.
@@ -514,6 +527,41 @@ pub mod tests {
         c.set_provider("cloudflare", None).unwrap();
         let cf = Doh::from_config(&c).unwrap();
         assert!(!cf.dot && cf.addrs.iter().all(|a| a.port() == 443));
+    }
+
+    /// A home server with its own certificate authority: trusted through the
+    /// CA file only (not the public roots), over DNS over TLS.
+    #[test]
+    fn home_server_with_its_own_ca() {
+        let (cert, _) = shared_cert().clone();
+        let b64 = |d: &[u8]| {
+            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut s = String::new();
+            for c in d.chunks(3) {
+                let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+                for i in 0..4 {
+                    s.push(if i <= c.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+                }
+            }
+            s
+        };
+        let dir = std::env::temp_dir().join(format!("pialite-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pem = format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", b64(&cert));
+        let f = dir.join("ca.pem");
+        std::fs::write(&f, &pem).unwrap();
+        assert_eq!(crate::config::check_ca_pem(pem.as_bytes()), Ok(1));
+        assert!(crate::config::check_ca_pem(b"hello").is_err());
+        let roots = custom_roots(&f).unwrap();
+        let d = Doh::new(tls_config_alpn(roots, &[b"dot"]), "dns.nextdns.io", "", vec![fake_dot_server("")]).unwrap().with_dot(true);
+        let q = dns::build_query(0x2222, "example.com", 1).unwrap();
+        assert_eq!(dns::id(&d.resolve(&q).unwrap()), Some(0x2222), "answered through the home CA");
+        // the public roots alone don't trust it
+        let p =
+            Doh::new(tls_config_alpn(public_roots(), &[b"dot"]), "dns.nextdns.io", "", vec![fake_dot_server("")]).unwrap().with_dot(true);
+        assert!(p.resolve(&q).is_err());
+        assert!(custom_roots(&dir.join("missing.pem")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A server with its OWN certificate, which the shared config doesn't trust.

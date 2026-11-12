@@ -332,67 +332,13 @@ What is protected, from what, and what is NOT claimed.
               reported as NOT confirmed, never as a match)
 
 10. Install / uninstall
-   Staged; each stage verified; nothing touches working DNS until NextDNS was reached
-   directly. Stages 3-5 are one undoable step: every change to the live setup - the
-   guard program, guard.json and the service (an upgrade keeps copies of the
-   previous program and settings), the NextDNS app, PIA's DNS - is written to an undo
-   list - in memory and in C:\ProgramData\PiaLite\install-undo.txt, replaced whole
-   by rename - BEFORE it is made. ANY failure in stages 3-5 undoes the list newest
-   first (an upgrade gets the previous guard back and running), reconnects, and
-   checks a real lookup; "rolled back" or "rollback incomplete" (with how to unlock
-   the internet if you are offline) is said plainly. An install cut off halfway is
-   undone at the start of the next run - but first (review V60-02), before anything
-   in C:\ProgramData\PiaLite is read, replayed or copied, a READ-ONLY check: no
-   junction or symbolic link anywhere in it (never followed - the folder is walked
-   without entering them), and the folder, every folder in it and every file PIA
-   Lite acts on owned by SYSTEM / Administrators / the installing admin and not
-   changeable by anyone else. If that fails the install or uninstall stops,
-   changes nothing and says what it found and what to do. Then the folder is
-   locked down (created locked if it is new) - before the undo list or any saved
-   copy is written - and only then is the undo list read: every line must be
-   exactly one of the forms the installer writes (at most 10 lines), or nothing
-   is undone. An upgrade's saved program is used only if its SHA-256 matches the
-   undo list. The program folder is checked for links before its permissions
-   are reset. Stage 5 requires
-   Windows' resolver to be proven to use the guard (override -AllowUnverifiedResolver).
-   Stage 6 (Fast Startup, removing the NextDNS app - permanent, asked) is
-   best-effort: a problem there is reported and the working install stays.
-   An upgrade's undo restores the previous program (checked against its SHA-256),
-   guard.json AND guard.json.bak exactly - same bytes, or absent if they didn't exist.
-   Finishing (review F51-04): the undo list is overwritten with "done" (flushed,
-   renamed - must succeed) BEFORE the saved copies are deleted; a "done" list left
-   behind only makes the next run tidy up, never undo with copies that are gone.
-   Every program the scripts run has a time limit (piactl, the guard, sc.exe,
-   services, the NextDNS uninstaller); a timeout is a failure like any other.
-   The limit covers the program ending AND its output being read (review F51-06),
-   plus up to ~8 s to stop what is still running after it (review V60-10):
-   a timed-out program is stopped with everything it started, and a program that
-   ends but leaves a child holding its output open counts as a timeout too - that
-   child is stopped. Output is read in pieces, kept up to 4 MB per stream (more is
-   read and dropped, and the result says it was cut); output that can't be read is
-   a failure, never a silent empty answer (review V60-07). Not a Windows job
-   object: a program started by a child after it was found can outlive this. One
-   copy of this code (scripts\PiaLite-Common.ps1) for the installer and the tests.
-   A second copy of the guard lives in C:\ProgramData\PiaLite\recovery (admin-only).
-   Uninstall picks ONE guard program first - installed, recovery copy, or the fresh
-   build - and uses it for every step: each candidate must exist, match the
-   SHA-256 recorded when the install finished (C:\ProgramData\PiaLite\guard.sha256;
-   not for the fresh build) and answer "version" (review F51-05). A broken one is
-   skipped with the reason shown; if none works it stops before changing anything
-   (rules outlive the program). It stops at the first critical failure
-   (kill switch, block rules, PIA's DNS) and keeps everything needed to retry. If
-   the hotel records can't settle whether a restore is outstanding (damaged record,
-   or guard.json unreadable - an older .bak is not proof), nothing is deleted until
-   you have checked PIA's kill switch and typed YES. Other leftovers (a file in use,
-   the service marked for removal, the NextDNS app not starting) are checked and
-   listed at the end - it only says "removed completely" when verified.
-   Unlock-Internet.bat uses the installed guard - or, if that is missing or fails,
-   its recovery copy; with neither working, it says the rules may still be there
-   and how to get the program back - never "nothing to unlock".
-   The tray starts at sign-in from a scheduled task ("PIA Lite Tray": the user's
-   own account, no admin rights, no time limit) instead of the Run key, which
+   Since 0.9 every installer runs `pialite-guard setup` / `teardown` - see
+   section 13. (The PowerShell installer of 0.1-0.6, with its undo list and
+   recovery copy, is retired.)
+   The tray starts at sign-in from a scheduled task ("PIA Lite Tray": every
+   user, no admin rights, no time limit) instead of the Run key, which
    Windows holds back until the desktop settles; the Run key is the fallback.
-   Starting that early has a catch (v0.6.2, found on Windows 11): the taskbar may
+   Starting that early has a catch (v0.6.2): the taskbar may
    not exist yet, and Slint adds the tray icon once, silently giving up if that
    fails, from a message-only window that never hears Windows' "TaskbarCreated"
    broadcast - the tray ran with no icon. Now the tray waits for the taskbar (up
@@ -497,3 +443,12 @@ What is protected, from what, and what is NOT claimed.
    the install folder, after the tray has closed; dpkg / rpm / install.sh).
    Unsigned releases are only announced. Hosts: github.com,
    api.github.com, *.githubusercontent.com; https only; bounded sizes.
+   0.9.1: custom servers may be tls://host[:port] or https://host[:port]/path
+   and may be trusted through their own CA only (custom-ca.pem in the data
+   folder, copied there by the admin's set-dns / setup after it parses as PEM
+   with at least one certificate). Setup reports what could bypass the guard:
+   DNS typed in by hand on a Windows adapter (incl. Windows' own DoH), other
+   DNS programs, another holder of port 53, systemd-resolved's own DoT; it
+   changes none of them except pausing the NextDNS app. `adapter-dns --reset`
+   (admin, on request) sets typed-in adapter DNS to automatic, saving the old
+   values in adapter-dns-before.json; teardown puts them back.
