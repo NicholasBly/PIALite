@@ -2,6 +2,29 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.10] - 2026-11-12
+
+Fixes from the independent v0.9.9 review (N99-01 .. N99-08).
+
+### Fixed
+- **The install.sh tests hide every real path install.sh can touch** (N99-01): `/etc/xdg/autostart` was not hidden,
+  so the uninstall test could have removed a real tray autostart entry. The isolation is now a checked contract:
+  every absolute path in install.sh must lie in a hidden folder, or the test refuses to run (and names the folder
+  to add). CI puts a stand-in file at each of those real paths and checks they are all untouched afterwards.
+- **Tests started from a namespace with shared mounts isolate themselves again** (N99-07): isolated now means our
+  own namespace AND no shared mount; CI runs a test that way and checks nothing leaked out.
+- **Tarball rollback checks the DNS block too** (N99-02): it records whether DNS went only through the guard
+  before, and "protects as before" needs that back as well; otherwise "could NOT be confirmed".
+- **A kept rollback copy is never overwritten** (N99-03): while one exists, install.sh changes nothing and points to
+  the new `sudo ./install.sh --restore-previous` (also the way back after a power cut mid-upgrade).
+- **Rollback checks its own steps** (N99-04): any restore step that fails (programs, share, settings, menu entry,
+  icon, launchers, starting the guard) is named and the copy is kept; settings and menu files that didn't exist
+  before are removed again; the menu entry and icon are restored from the copy.
+- **An installed guard whose program isn't /opt/pialite** (e.g. a .deb) is not stopped by the tarball installer
+  (N99-06) - it changes nothing and says to remove that one first.
+- **Recovery after an unreadable earlier state also expects the saved DNS feature** (N99-05): a guard back with
+  its block but without its DNS block / redirect isn't confirmed.
+
 ## [0.9.9] - 2026-11-12
 
 Fixes from the independent v0.9.8 review (R98-01 .. R98-09).

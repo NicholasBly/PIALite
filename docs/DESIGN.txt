@@ -511,3 +511,11 @@ What is protected, from what, and what is NOT claimed.
    status. Recovery: unknown earlier state = checked against the saved mode,
    Off never confirmed; removing the guard restores the previous settings
    before restarting it; service removal retried once.
+   0.9.10 (review N99): tests/isolate.sh hides /etc/xdg/autostart too, and
+   refuses unless every absolute path in install.sh is inside a hidden
+   folder; isolated = own mount ns AND no shared mount. install.sh: a kept
+   /opt/pialite.rollback blocks any upgrade (use --restore-previous); a
+   guard unit without /opt/pialite/bin/pialite-guard is not touched; the
+   copy also holds the menu entry, icon, absent-file markers and the
+   guard's earlier mode + DNS state; restore_previous checks every step and
+   the DNS block before "as before".

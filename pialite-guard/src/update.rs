@@ -425,6 +425,7 @@ mod tests {
     fn versions() {
         assert!(is_newer("v0.9.1", "0.9.0"));
         assert!(is_newer("1.0.0", "0.9.9"));
+        assert!(is_newer("0.9.10", "0.9.9"), "numbers, not text");
         assert!(!is_newer("0.9.0", "0.9.0"));
         assert!(!is_newer("0.8.9", "0.9.0"));
         assert!(!is_newer("1.0.0-rc1", "0.9.0"), "pre-releases aren't offered");
