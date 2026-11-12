@@ -468,6 +468,11 @@ mod stub {
         }
         Ok(DNS_CAPTURE.load(std::sync::atomic::Ordering::SeqCst))
     }
+    #[allow(dead_code)]
+    pub fn dns_block_damage_for_test(_how: u8) -> Result<(), String> {
+        DNS_CAPTURE.store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
     /// Tests: every DNS block/redirect change fails / every check fails.
     pub fn fail_dns_capture(on: bool) {
         DNS_FAIL.store(on, std::sync::atomic::Ordering::SeqCst);
@@ -763,17 +768,19 @@ mod linux {
         }
     }
 
+    /// Order (review F-02): the boot unit off, then the saved rules, and the
+    /// live rules LAST - a failure before that leaves the PC protected, for
+    /// the caller to recover (teardown starts the guard again).
     pub fn uninstall() -> Result<(), String> {
-        if list(nft::TABLE)?.is_some() {
-            nft(&["delete", "table", "inet", nft::TABLE], None)?;
-        }
-        // the boot unit off first: a failure leaves the saved rules, so
-        // installed() still says "present" (review V95-12)
+        // a failed disable leaves the saved rules, so installed() still says "present" (V95-12)
         remove_boot().map_err(|e| format!("could not disable the boot protection unit: {e}"))?;
         match std::fs::remove_file(saved_path()) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("{}: {e}", saved_path().display())),
+        }
+        if list(nft::TABLE)?.is_some() {
+            nft(&["delete", "table", "inet", nft::TABLE], None)?;
         }
         Ok(())
     }
@@ -1459,6 +1466,50 @@ mod win {
         }
     }
 
+    /// We add the weight as a UINT8 range index. If Windows hands back another
+    /// type, the computed weight's top 4 bits must be that index; anything else
+    /// is a difference (no silent pass on an unexpected type).
+    fn weight_is(f: &FWPM_FILTER0, weight: u8) -> bool {
+        unsafe {
+            if f.weight.r#type == FWP_UINT8 {
+                f.weight.Anonymous.uint8 == weight
+            } else {
+                f.effectiveWeight.r#type == FWP_UINT64
+                    && !f.effectiveWeight.Anonymous.uint64.is_null()
+                    && (*f.effectiveWeight.Anonymous.uint64 >> 60) as u8 == weight
+            }
+        }
+    }
+
+    /// The filter's conditions are exactly those `cond` is built from (any
+    /// order). Ok(Some(what differs)), Ok(None) = the same.
+    fn conditions_are(f: &FWPM_FILTER0, cond: &Cond, v6: bool) -> Result<Option<&'static str>, String> {
+        let want = build(cond, v6)?;
+        let have: &[FWPM_FILTER_CONDITION0] = if f.numFilterConditions == 0 || f.filterCondition.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(f.filterCondition, f.numFilterConditions as usize) }
+        };
+        if have.len() != want.list.len() {
+            return Ok(Some("number of conditions"));
+        }
+        // order-independent: every planned condition matches one stored one
+        let mut used = vec![false; have.len()];
+        let all = want.list.iter().all(|w| {
+            let hit = have.iter().enumerate().position(|(i, h)| {
+                !used[i]
+                    && same_guid(&h.fieldKey, &w.fieldKey)
+                    && h.matchType == w.matchType
+                    && value_eq(&h.conditionValue, &w.conditionValue)
+            });
+            if let Some(i) = hit {
+                used[i] = true;
+            }
+            hit.is_some()
+        });
+        Ok((!all).then_some("condition values"))
+    }
+
     /// Compare one stored filter with what it must be - every property we set,
     /// including each condition's value (review V3-05).
     fn check_filter(f: &FWPM_FILTER0, s: &FilterSpec) -> Result<(), String> {
@@ -1481,19 +1532,7 @@ mod win {
         if f.flags & want_flag == 0 || f.flags & RISKY != 0 {
             bad.push("flags");
         }
-        // We add the weight as a UINT8 range index. If Windows hands back another
-        // type, the computed weight's top 4 bits must be that index; anything else
-        // is a difference (no silent pass on an unexpected type).
-        let weight_ok = unsafe {
-            if f.weight.r#type == FWP_UINT8 {
-                f.weight.Anonymous.uint8 == s.weight
-            } else {
-                f.effectiveWeight.r#type == FWP_UINT64
-                    && !f.effectiveWeight.Anonymous.uint64.is_null()
-                    && (*f.effectiveWeight.Anonymous.uint64 >> 60) as u8 == s.weight
-            }
-        };
-        if !weight_ok {
+        if !weight_is(f, s.weight) {
             bad.push("weight");
         }
         match s.kind {
@@ -1515,36 +1554,10 @@ mod win {
             }
         }
         // the conditions it must have, built exactly as when it was added
-        match build(&s.cond, s.v6) {
+        match conditions_are(f, &s.cond, s.v6) {
             Err(e) => return Err(format!("rule #{}: {e}", s.index)),
-            Ok(want) => {
-                let have: &[FWPM_FILTER_CONDITION0] = if f.numFilterConditions == 0 || f.filterCondition.is_null() {
-                    &[]
-                } else {
-                    unsafe { std::slice::from_raw_parts(f.filterCondition, f.numFilterConditions as usize) }
-                };
-                if have.len() != want.list.len() {
-                    bad.push("number of conditions");
-                } else {
-                    // order-independent: every planned condition matches one stored one
-                    let mut used = vec![false; have.len()];
-                    let all = want.list.iter().all(|w| {
-                        let hit = have.iter().enumerate().position(|(i, h)| {
-                            !used[i]
-                                && same_guid(&h.fieldKey, &w.fieldKey)
-                                && h.matchType == w.matchType
-                                && value_eq(&h.conditionValue, &w.conditionValue)
-                        });
-                        if let Some(i) = hit {
-                            used[i] = true;
-                        }
-                        hit.is_some()
-                    });
-                    if !all {
-                        bad.push("condition values");
-                    }
-                }
-            }
+            Ok(Some(why)) => bad.push(why),
+            Ok(None) => {}
         }
         if bad.is_empty() {
             Ok(())
@@ -2048,7 +2061,42 @@ mod win {
     /// internet block's checks don't see it, and if the guard stops, Windows
     /// removes it by itself - it can never leave the PC without DNS.
     const DNS_SUBLAYER: GUID = GUID::from_u128(0x5a1f7e2c_3b4d_4c8a_9e61_2f0b6d1c7a03);
-    static DNS_BLOCK: std::sync::Mutex<Option<Engine>> = std::sync::Mutex::new(None);
+
+    /// One rule of the DNS block, as planned.
+    #[derive(Clone)]
+    struct DnsRule {
+        v6: bool,
+        weight: u8,
+        permit: bool,
+        cond: Cond,
+        name: String,
+    }
+
+    /// The session holding the DNS block, and the id Windows gave each rule.
+    struct DnsBlock {
+        e: Engine,
+        rules: Vec<(u64, DnsRule)>,
+    }
+    static DNS_BLOCK: std::sync::Mutex<Option<DnsBlock>> = std::sync::Mutex::new(None);
+
+    fn dns_plan() -> Vec<DnsRule> {
+        let mut allowed = crate::pia::engine_exes();
+        if let Ok(me) = std::env::current_exe() {
+            allowed.push(me.to_string_lossy().into_owned());
+        }
+        let mut v = vec![];
+        for v6 in [false, true] {
+            let r = |weight: u8, permit: bool, cond: Cond, name: &str| DnsRule { v6, weight, permit, cond, name: name.to_string() };
+            v.push(r(15, true, Cond::Loopback, "DNS block: allow loopback (the guard's DNS proxy)"));
+            for a in &allowed {
+                let file = a.rsplit(['\\', '/']).next().unwrap_or(a);
+                v.push(r(14, true, Cond::App(a.clone()), &format!("DNS block: allow {file}")));
+            }
+            v.push(r(1, false, Cond::RemotePort(53), "DNS block: no plain DNS around the guard"));
+            v.push(r(1, false, Cond::RemotePort(853), "DNS block: no DNS over TLS around the guard"));
+        }
+        v
+    }
 
     fn dns_sublayer_there(e: &Engine) -> bool {
         let mut s: *mut FWPM_SUBLAYER0 = null_mut();
@@ -2059,19 +2107,73 @@ mod win {
         found
     }
 
-    fn add_dns_filter(e: &Engine, v6: bool, weight: u8, permit: bool, cond: &Cond, name: &str) -> Result<(), String> {
-        let mut conds = build(cond, v6)?;
-        let wname = wide(&format!("PIA Lite: {name}"));
+    fn add_dns_filter(e: &Engine, r: &DnsRule) -> Result<u64, String> {
+        let mut conds = build(&r.cond, r.v6)?;
+        let wname = wide(&format!("PIA Lite: {}", r.name));
         let mut f = FWPM_FILTER0::default();
         f.displayData.name = wname.as_ptr() as *mut u16;
-        f.layerKey = layer(v6);
+        f.layerKey = layer(r.v6);
         f.subLayerKey = DNS_SUBLAYER;
-        f.weight = FWP_VALUE0 { r#type: FWP_UINT8, Anonymous: FWP_VALUE0_0 { uint8: weight } };
+        f.weight = FWP_VALUE0 { r#type: FWP_UINT8, Anonymous: FWP_VALUE0_0 { uint8: r.weight } };
         f.numFilterConditions = conds.list.len() as u32;
         f.filterCondition = if conds.list.is_empty() { null_mut() } else { conds.list.as_mut_ptr() };
-        f.action.r#type = if permit { FWP_ACTION_PERMIT } else { FWP_ACTION_BLOCK };
+        f.action.r#type = if r.permit { FWP_ACTION_PERMIT } else { FWP_ACTION_BLOCK };
         let mut id = 0u64;
-        check(&format!("Adding rule '{name}'"), unsafe { FwpmFilterAdd0(e.0, &f, null_mut(), &mut id) })
+        check(&format!("Adding rule '{}'", r.name), unsafe { FwpmFilterAdd0(e.0, &f, null_mut(), &mut id) })?;
+        Ok(id)
+    }
+
+    /// Is the DNS block exactly as added (review F-03)? Its sublayer; every
+    /// rule by its id - layer, sublayer, action, weight, flags, each condition;
+    /// and nothing else in the sublayer. Ok(Some(what differs)), Ok(None) =
+    /// intact, Err = Windows couldn't be asked.
+    fn dns_block_differs(b: &DnsBlock) -> Result<Option<String>, String> {
+        if !dns_sublayer_there(&b.e) {
+            return Ok(Some("its sublayer is gone".into()));
+        }
+        const RISKY: u32 =
+            FWPM_FILTER_FLAG_DISABLED | FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT | FWPM_FILTER_FLAG_PERMIT_IF_CALLOUT_UNREGISTERED;
+        for (id, r) in &b.rules {
+            let mut f: *mut FWPM_FILTER0 = null_mut();
+            let rc = unsafe { FwpmFilterGetById0(b.e.0, *id, &mut f) };
+            if rc == FWP_E_FILTER_NOT_FOUND as u32 {
+                return Ok(Some(format!("rule '{}' is gone", r.name)));
+            }
+            if rc != 0 || f.is_null() {
+                return Err(format!("could not read DNS block rule '{}' (error 0x{rc:08X})", r.name));
+            }
+            let held = Got(f);
+            let f = unsafe { &*held.0 };
+            let action = if r.permit { FWP_ACTION_PERMIT } else { FWP_ACTION_BLOCK };
+            let why = if !same_guid(&f.layerKey, &layer(r.v6)) {
+                Some("layer")
+            } else if !same_guid(&f.subLayerKey, &DNS_SUBLAYER) {
+                Some("sublayer")
+            } else if f.action.r#type != action {
+                Some("action")
+            } else if !weight_is(f, r.weight) {
+                Some("weight")
+            } else if f.flags & RISKY != 0 {
+                Some("flags")
+            } else {
+                conditions_are(f, &r.cond, r.v6)?
+            };
+            if let Some(w) = why {
+                return Ok(Some(format!("rule '{}' changed ({w})", r.name)));
+            }
+        }
+        let mut count = 0usize;
+        for v6 in [false, true] {
+            list(&b.e, v6, None, 0, |f| {
+                if same_guid(&f.subLayerKey, &DNS_SUBLAYER) {
+                    count += 1;
+                }
+            })?;
+        }
+        if count != b.rules.len() {
+            return Ok(Some(format!("{count} rules in its sublayer instead of {}", b.rules.len())));
+        }
+        Ok(None)
     }
 
     pub fn dns_capture(on: bool) -> Result<(), String> {
@@ -2080,17 +2182,18 @@ mod win {
             *held = None; // closing the session removes its sublayer and rules
             return Ok(());
         }
-        if held.as_ref().is_some_and(dns_sublayer_there) {
-            return Ok(());
+        if let Some(b) = held.as_ref() {
+            match dns_block_differs(b) {
+                Ok(None) => return Ok(()),
+                Ok(Some(why)) => crate::config::log(&format!("the DNS block isn't intact ({why}) - adding it again")),
+                Err(e) => crate::config::log(&format!("could not check the DNS block ({e}) - adding it again")),
+            }
         }
-        *held = None;
+        *held = None; // a damaged block goes with its session
         let e = Engine::open(true)?;
-        let mut allowed = crate::pia::engine_exes();
-        if let Ok(me) = std::env::current_exe() {
-            allowed.push(me.to_string_lossy().into_owned());
-        }
+        let plan = dns_plan();
         let sname = wide("PIA Lite: plain DNS only through the guard");
-        e.txn_as("Adding the DNS block", || {
+        let rules = e.txn_as("Adding the DNS block", || {
             let s = FWPM_SUBLAYER0 {
                 subLayerKey: DNS_SUBLAYER,
                 displayData: FWPM_DISPLAY_DATA0 { name: sname.as_ptr() as *mut u16, description: null_mut() },
@@ -2098,23 +2201,44 @@ mod win {
                 ..Default::default()
             };
             check("Adding the DNS block's sublayer", unsafe { FwpmSubLayerAdd0(e.0, &s, null_mut()) })?;
-            for v6 in [false, true] {
-                add_dns_filter(&e, v6, 15, true, &Cond::Loopback, "DNS block: allow loopback (the guard's DNS proxy)")?;
-                for a in &allowed {
-                    let file = a.rsplit(['\\', '/']).next().unwrap_or(a);
-                    add_dns_filter(&e, v6, 14, true, &Cond::App(a.clone()), &format!("DNS block: allow {file}"))?;
-                }
-                add_dns_filter(&e, v6, 1, false, &Cond::RemotePort(53), "DNS block: no plain DNS around the guard")?;
-                add_dns_filter(&e, v6, 1, false, &Cond::RemotePort(853), "DNS block: no DNS over TLS around the guard")?;
+            let mut rules = vec![];
+            for r in &plan {
+                rules.push((add_dns_filter(&e, r)?, r.clone()));
             }
-            Ok(())
+            Ok(rules)
         })?;
-        *held = Some(e);
+        let b = DnsBlock { e, rules };
+        if let Some(why) = dns_block_differs(&b)? {
+            return Err(format!("the DNS block isn't as planned right after adding it ({why})"));
+        }
+        *held = Some(b);
         Ok(())
     }
 
+    /// The DNS block is there AND intact (every rule checked, nothing extra).
     pub fn dns_capture_active() -> Result<bool, String> {
-        Ok(DNS_BLOCK.lock().unwrap().as_ref().is_some_and(dns_sublayer_there))
+        match DNS_BLOCK.lock().unwrap().as_ref() {
+            None => Ok(false),
+            Some(b) => Ok(dns_block_differs(b)?.is_none()),
+        }
+    }
+
+    /// selftest-firewall only: damage the DNS block the way someone else
+    /// could - 0 = delete its last rule (IPv6, port 853), 1 = add a permit-all
+    /// to its sublayer - so the check above can be seen to notice.
+    pub fn dns_block_damage_for_test(how: u8) -> Result<(), String> {
+        let held = DNS_BLOCK.lock().unwrap();
+        let b = held.as_ref().ok_or("no DNS block")?;
+        match how {
+            0 => {
+                let (id, _) = b.rules.last().ok_or("no rules")?;
+                check("Deleting a DNS block rule (test)", unsafe { FwpmFilterDeleteById0(b.e.0, *id) })
+            }
+            _ => {
+                let r = DnsRule { v6: false, weight: 15, permit: true, cond: Cond::All, name: "TEST stray permit".into() };
+                add_dns_filter(&b.e, &r).map(|_| ())
+            }
+        }
     }
 
     pub fn open_all() -> Result<OpenAll, String> {

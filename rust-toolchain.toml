@@ -1,0 +1,7 @@
+# The Rust version every build uses (CI, releases, local) - so a release is
+# built with a known compiler, not whatever "stable" is that day. Raise it on
+# purpose, in its own commit.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

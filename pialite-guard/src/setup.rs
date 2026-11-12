@@ -481,7 +481,7 @@ pub fn setup(mut o: Options) -> Result<(), String> {
         sys::start_service()?;
         // a guard that doesn't answer, or whose chosen block isn't in place, is
         // a failed setup - not a warning nobody sees in an installer log (V95-06)
-        let st = wait_until_armed(Duration::from_secs(30))?;
+        let st = wait_until_armed(cfg.mode, Duration::from_secs(30))?;
         rep.ok(format!(
             "guard service running (version {}){}",
             st.version,
@@ -548,14 +548,52 @@ pub fn setup(mut o: Options) -> Result<(), String> {
     Ok(())
 }
 
-/// The guard answers and, unless its block mode is Off, has its block in place.
-fn wait_until_armed(limit: Duration) -> Result<pialite_common::status::GuardStatus, String> {
+/// Teardown's firewall part, in the order that keeps the PC usable if a step
+/// fails (review F-02): first the DNS redirect (Linux) - while the guard can
+/// still be started again to answer the lookups it sends to 127.0.0.1 - then
+/// the block (`firewall::uninstall`: boot unit, saved rules, live rules last),
+/// each checked.
+///
+/// On any failure `restart` starts the guard again (it puts its rules and the
+/// redirect back), and the error says what state the PC is in.
+fn remove_firewall_parts(rep: &mut Report, restart: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+    let steps = |rep: &mut Report| -> Result<(), String> {
+        firewall::dns_capture(false).map_err(|e| format!("could not remove the DNS redirect ({e})"))?;
+        match firewall::dns_capture_active() {
+            Ok(false) => {}
+            Ok(true) => return Err("the DNS redirect is STILL in place".into()),
+            Err(e) => return Err(format!("could not check the DNS redirect was removed ({e})")),
+        }
+        firewall::uninstall()?;
+        firewall::reset_open().map_err(|e| format!("could not remove the temporary allow-all ({e})"))?;
+        match firewall::installed() {
+            Ok(false) => rep.ok("internet block rules removed (checked)"),
+            Ok(true) => return Err("block rules are STILL in place".into()),
+            Err(e) => return Err(format!("could not check the block rules were removed ({e})")),
+        }
+        Ok(())
+    };
+    steps(rep).map_err(|e| match restart() {
+        Ok(()) => format!(
+            "{e} - teardown stopped; the guard was started again, so its block and DNS are back as before. \
+             Fix the cause and run teardown again"
+        ),
+        Err(r) => format!(
+            "{e} - teardown stopped, and the guard could not be started again ({r}). \
+             If you are offline or lookups fail: run `pialite-guard unlock` as admin"
+        ),
+    })
+}
+
+/// The guard answers - THIS version, with the block mode just saved - and,
+/// unless that mode is Off, has its block in place (review V95-06, F-01).
+fn wait_until_armed(want: BlockMode, limit: Duration) -> Result<pialite_common::status::GuardStatus, String> {
     let until = std::time::Instant::now() + limit;
     loop {
         let left = until.saturating_duration_since(std::time::Instant::now());
         let st = sys::wait_for_guard(left.max(Duration::from_secs(1)))
             .map_err(|e| format!("{e} - PIA Lite is NOT set up (see the guard log)"))?;
-        if let Some(why) = unarmed(&st) {
+        if let Some(why) = not_ready(&st, want, env!("CARGO_PKG_VERSION")) {
             if std::time::Instant::now() >= until {
                 return Err(format!("{why} - PIA Lite is NOT set up"));
             }
@@ -566,12 +604,24 @@ fn wait_until_armed(limit: Duration) -> Result<pialite_common::status::GuardStat
     }
 }
 
-/// Why the guard's chosen protection isn't in place (None = it is).
-fn unarmed(st: &pialite_common::status::GuardStatus) -> Option<String> {
-    (st.mode != BlockMode::Off && !st.armed).then(|| {
+/// Why the running guard isn't what setup just installed (None = it is):
+/// another version, another block mode than the one saved, or that mode's
+/// block not in place. Exact match only - a stronger mode than asked for is
+/// still "not what was set up".
+fn not_ready(st: &pialite_common::status::GuardStatus, want: BlockMode, version: &str) -> Option<String> {
+    if st.version != version {
+        return Some(format!(
+            "the guard service runs version {} instead of {version}",
+            if st.version.is_empty() { "?" } else { &st.version }
+        ));
+    }
+    if st.mode != want {
+        return Some(format!("the guard service runs with block mode {} instead of {}", st.mode.as_str(), want.as_str()));
+    }
+    (want != BlockMode::Off && !st.armed).then(|| {
         format!(
             "the guard could not put the internet block ({}) in place: {}",
-            st.mode.as_str(),
+            want.as_str(),
             if st.fw_error.is_empty() { "see the guard log" } else { &st.fw_error }
         )
     })
@@ -879,23 +929,9 @@ pub fn teardown(keep_config: bool) -> Result<(), String> {
     if was_running {
         rep.ok("guard service stopped");
     }
-    // 2. the block, checked
-    firewall::uninstall()?;
-    firewall::reset_open().map_err(|e| format!("could not remove the temporary allow-all ({e}) - not continuing"))?;
-    match firewall::installed() {
-        Ok(false) => rep.ok("internet block rules removed (checked)"),
-        Ok(true) => return Err("block rules are STILL in place - run `pialite-guard unlock` as admin, then teardown again".into()),
-        Err(e) => return Err(format!("could not check the block rules were removed ({e}) - not continuing")),
-    }
-    // the DNS redirect (Linux) must not outlive the proxy it points at (review V95-17)
-    firewall::dns_capture(false).map_err(|e| {
-        format!("could not remove the DNS redirect ({e}) - not continuing; run `pialite-guard unlock` as admin, then teardown again")
-    })?;
-    match firewall::dns_capture_active() {
-        Ok(false) => {}
-        Ok(true) => return Err("the DNS redirect is STILL in place - run `pialite-guard unlock` as admin, then teardown again".into()),
-        Err(e) => return Err(format!("could not check the DNS redirect was removed ({e}) - not continuing")),
-    }
+    // 2. DNS redirect, then the block - each checked; a failure starts the
+    //    guard again, so the PC is protected and has DNS as before (F-02)
+    remove_firewall_parts(&mut rep, &|| if was_running { sys::start_service() } else { Err("it wasn't running before".into()) })?;
     // 3. PIA as it was: DNS, kill switch (an unfinished hotel login), NextDNS app, startup task
     restore_pia_dns(&mut rep);
     match sys::restore_adapter_dns() {
@@ -1052,6 +1088,31 @@ mod tests {
         assert!(out.len() <= 256 * 1024 + 16 && out.ends_with("err\n"), "{} bytes", out.len());
         let (ok, _) = sys::run_within("sh", &["-c", "exit 3"], Duration::from_secs(5)).unwrap();
         assert!(!ok);
+        // review F-05: what the program starts is bounded and stopped too
+        let dir = std::env::temp_dir().join(format!("pialite-run-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let gone = |pid: &str| {
+            // killed: no process, or only a zombie nobody has collected yet
+            std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+                .map(|st| st.rsplit(')').next().unwrap_or("").trim_start().starts_with('Z'))
+                .unwrap_or(true)
+        };
+        // 1. exits at once, but leaves a background program holding the output
+        let script = format!("sleep 30 & echo $! > '{}'; echo hi", pidfile.display());
+        let t = Instant::now();
+        let e = sys::run_within("sh", &["-c", &script], Duration::from_secs(1)).unwrap_err();
+        assert!(e.contains("still held its output") && t.elapsed() < Duration::from_secs(4), "{e} after {:?}", t.elapsed());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(gone(&std::fs::read_to_string(&pidfile).unwrap()), "the background program was stopped");
+        // 2. runs past the limit, with a child of its own
+        let script = format!("sleep 30 & echo $! > '{}'; sleep 30", pidfile.display());
+        let t = Instant::now();
+        let e = sys::run_within("sh", &["-c", &script], Duration::from_millis(500)).unwrap_err();
+        assert!(e.contains("did not finish") && t.elapsed() < Duration::from_secs(3), "{e}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(gone(&std::fs::read_to_string(&pidfile).unwrap()), "its child was stopped with it");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1088,34 +1149,122 @@ mod tests {
         assert_eq!(w("S-1-5-32-544", Some(&[ace("S-1-5-11", 0x1301bf, false)]), MOVE_RIGHTS, true).len(), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn data_files_are_root_only_whatever_the_umask() {
+        // review F-06
+        use std::os::unix::fs::PermissionsExt;
+        let _g = config::tests::ENV_LOCK.lock().unwrap();
+        let d = config::tests::temp_data("modes");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let old = unsafe { libc::umask(0o022) };
+        config::save(&Config::default()).unwrap();
+        config::save(&Config::default()).unwrap(); // the second save also writes the .bak
+        sys::write_record(&sys::InstallRecord::default()).unwrap();
+        unsafe { libc::umask(old) };
+        assert_eq!(mode(&d.join("guard.json")), 0o600);
+        assert_eq!(mode(&d.join("guard.json.bak")), 0o600);
+        assert_eq!(mode(&d.join("install.json")), 0o644, "the tray reads it");
+        // a link in the folder is refused before anything is trusted
+        std::os::unix::fs::symlink("/etc/hostname", d.join("hotel-recovery.json")).unwrap();
+        assert!(sys::harden_data_files(&d).unwrap_err().contains("is a link"));
+        std::fs::remove_file(d.join("hotel-recovery.json")).unwrap();
+        // as root: owners and modes put right
+        if unsafe { libc::geteuid() } == 0 {
+            std::fs::set_permissions(d.join("guard.json"), std::fs::Permissions::from_mode(0o666)).unwrap();
+            std::fs::write(d.join("notes.txt"), "x").unwrap();
+            std::fs::set_permissions(d.join("notes.txt"), std::fs::Permissions::from_mode(0o4777)).unwrap();
+            sys::harden_data_files(&d).unwrap();
+            assert_eq!(mode(&d.join("guard.json")), 0o600);
+            assert_eq!(std::fs::metadata(d.join("notes.txt")).unwrap().permissions().mode() & 0o7777, 0o755);
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn a_block_that_is_not_in_place_fails_setup() {
-        // review V95-06
+        // review V95-06 / F-01: the running guard must be this version, in the
+        // mode just saved, with that mode's block in place
         use pialite_common::status::GuardStatus;
-        let st = |mode, armed, err: &str| GuardStatus { mode, armed, fw_error: err.into(), ..Default::default() };
-        assert!(unarmed(&st(BlockMode::Off, false, "")).is_none(), "Off: nothing to arm");
-        assert!(unarmed(&st(BlockMode::Startup, true, "")).is_none());
-        let why = unarmed(&st(BlockMode::Always, false, "Adding rule 'x' failed")).unwrap();
+        let v = "9.9.9";
+        let st = |mode, armed, err: &str| GuardStatus { version: v.into(), mode, armed, fw_error: err.into(), ..Default::default() };
+        assert!(not_ready(&st(BlockMode::Off, false, ""), BlockMode::Off, v).is_none(), "Off asked, Off running");
+        assert!(not_ready(&st(BlockMode::Startup, true, ""), BlockMode::Startup, v).is_none());
+        let why = not_ready(&st(BlockMode::Always, false, "Adding rule 'x' failed"), BlockMode::Always, v).unwrap();
         assert!(why.contains("always") && why.contains("Adding rule"), "{why}");
-        assert!(unarmed(&st(BlockMode::Startup, false, "")).unwrap().contains("guard log"));
+        assert!(not_ready(&st(BlockMode::Startup, false, ""), BlockMode::Startup, v).unwrap().contains("guard log"));
+        // Always asked, the service says Off: not set up (it was "fine" before)
+        let why = not_ready(&st(BlockMode::Off, false, ""), BlockMode::Always, v).unwrap();
+        assert!(why.contains("mode off instead of always"), "{why}");
+        assert!(not_ready(&st(BlockMode::Always, true, ""), BlockMode::Startup, v).is_some(), "not even a stronger mode");
+        let old = GuardStatus { version: "0.9.5".into(), mode: BlockMode::Startup, armed: true, ..Default::default() };
+        assert!(not_ready(&old, BlockMode::Startup, v).unwrap().contains("version 0.9.5 instead of 9.9.9"));
     }
 
     #[test]
     fn a_service_that_did_not_stop_is_an_error() {
-        // review V95-02: `systemctl stop` failing, or the guard still running,
-        // must stop teardown before it touches the firewall
+        // review V95-02 / F-04: `systemctl stop` failing, the guard still
+        // running, or systemd not answering must stop teardown before it
+        // touches the firewall
         use std::time::Duration;
         let short = Duration::from_millis(300);
-        assert!(sys::stopped_or_why(true, "", || false, short).is_ok());
-        let e = sys::stopped_or_why(false, "Job for pialite-guard.service canceled.", || false, short).unwrap_err();
+        assert!(sys::stopped_or_why(true, "", || Ok(false), short).is_ok());
+        let e = sys::stopped_or_why(false, "Job for pialite-guard.service canceled.", || Ok(false), short).unwrap_err();
         assert!(e.contains("could not stop") && e.contains("canceled"), "{e}");
-        assert!(sys::stopped_or_why(true, "", || true, short).unwrap_err().contains("still running"));
+        assert!(sys::stopped_or_why(true, "", || Ok(true), short).unwrap_err().contains("still running"));
+        let bus = || Err("systemd could not be asked about the guard service: Failed to connect to bus".to_string());
+        let e = sys::stopped_or_why(true, "", bus, short).unwrap_err();
+        assert!(e.contains("Failed to connect to bus") && e.contains("nothing was changed"), "{e}");
         let n = std::cell::Cell::new(0);
         let stops_soon = || {
             n.set(n.get() + 1);
-            n.get() < 3
+            Ok(n.get() < 3)
         };
         assert!(sys::stopped_or_why(true, "", stops_soon, Duration::from_secs(5)).is_ok(), "waits for it");
+        // what systemd says
+        assert_eq!(sys::active_state(true, "inactive\n"), Ok(false));
+        assert_eq!(sys::active_state(true, "failed\n"), Ok(false));
+        assert_eq!(sys::active_state(true, "deactivating\n"), Ok(true));
+        assert!(sys::active_state(false, "Failed to connect to bus: No such file or directory").is_err());
+        assert!(sys::active_state(true, "").is_err(), "no answer is not 'stopped'");
+    }
+
+    #[test]
+    fn a_failed_teardown_step_starts_the_guard_again() {
+        // review F-02: DNS redirect first, the block after; any failure restarts
+        // the guard (which puts its rules back) and says so
+        let _g = config::tests::ENV_LOCK.lock().unwrap();
+        let mut rep = Report { lines: vec![], warnings: vec![] };
+        let restarted = std::cell::Cell::new(0);
+        let restart = || {
+            restarted.set(restarted.get() + 1);
+            Ok(())
+        };
+        let block = || firewall::install(&firewall::plan(&[], false)).map(|_| ()).unwrap();
+        // the DNS redirect can't be removed: nothing else is touched
+        block();
+        firewall::dns_capture(true).unwrap();
+        firewall::fail_dns_capture(true);
+        let e = remove_firewall_parts(&mut rep, &restart).unwrap_err();
+        firewall::fail_dns_capture(false);
+        assert!(e.contains("DNS redirect") && e.contains("started again"), "{e}");
+        assert_eq!(restarted.get(), 1);
+        assert_eq!(firewall::installed(), Ok(true), "the block was left in place");
+        // the block can't be removed
+        firewall::fail_next_uninstall();
+        let e = remove_firewall_parts(&mut rep, &restart).unwrap_err();
+        assert!(e.contains("injected uninstall failure"), "{e}");
+        assert_eq!(restarted.get(), 2);
+        // ...and if the guard can't start again either, the way out is named
+        firewall::fail_next_uninstall();
+        let e = remove_firewall_parts(&mut rep, &|| Err("no unit".into())).unwrap_err();
+        assert!(e.contains("could not be started again (no unit)") && e.contains("unlock"), "{e}");
+        // all fine: everything removed and checked, nothing restarted
+        firewall::dns_capture(true).unwrap();
+        remove_firewall_parts(&mut rep, &restart).unwrap();
+        assert_eq!(restarted.get(), 2);
+        assert_eq!(firewall::installed(), Ok(false));
+        assert_eq!(firewall::dns_capture_active(), Ok(false));
     }
 
     #[test]

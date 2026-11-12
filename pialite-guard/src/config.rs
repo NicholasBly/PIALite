@@ -468,7 +468,17 @@ fn write_durable(target: &std::path::Path, text: &str, before_rename: impl FnOnc
     let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
     let write = || -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+        // a new file, readable by root/SYSTEM only (Linux: 0600 whatever the
+        // umask, review F-06); a stale temp file of this pid is replaced
+        let _ = std::fs::remove_file(&tmp);
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        let mut f = o.open(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()
     };

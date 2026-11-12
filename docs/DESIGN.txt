@@ -479,3 +479,15 @@ What is protected, from what, and what is NOT claimed.
    any of them (drive roots: owner not checked). setup fails when the guard
    doesn't answer or the chosen block isn't armed within 30 s. Releases:
    release.yml calls ci.yml (workflow_call) and publishes its artifacts.
+   0.9.7 (review F): setup requires the running guard's version and block
+   mode to equal what it installed (and armed if not Off). Teardown order:
+   DNS redirect (checked) -> boot unit -> saved rules -> live rules
+   (checked); any failure restarts the guard. Windows DNS block: each rule's
+   id kept; the 30 s check reads every rule (layer, sublayer, action,
+   weight, flags, conditions) and counts the sublayer's rules; damaged =
+   not on, rebuilt. Linux service state from `systemctl show -p
+   ActiveState` - no answer is an error, never "stopped". Commands: own
+   process group / job object, killed as a whole; the output wait is
+   bounded. Linux data files 0600 (install.json 0644), links / hard links
+   refused, owner root. Windows: reparse points on the program path are
+   refused. install.sh: "can't inspect" is never "clean".

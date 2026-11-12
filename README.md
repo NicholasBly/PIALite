@@ -268,7 +268,7 @@ decides where windows go.
 
 ## Building from source
 
-Requirements: [Rust](https://rustup.rs) (stable). Linux also needs `libfontconfig1-dev` (Debian/Ubuntu) or
+Requirements: [Rust](https://rustup.rs) - the version in `rust-toolchain.toml` (rustup picks it up by itself). Linux also needs `libfontconfig1-dev` (Debian/Ubuntu) or
 `fontconfig-devel` (Fedora).
 
 ```sh

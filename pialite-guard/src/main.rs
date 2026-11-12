@@ -1326,9 +1326,10 @@ fn selftest_allowed(service: bool, rules: Result<bool, String>, force: bool) -> 
 }
 
 /// Windows, with the temporary allow-all in place: before the DNS block a
-/// program (PowerShell) gets an answer from 9.9.9.9; with it, its lookup and
-/// its DNS-over-TLS connection are refused while the guard's own connection
-/// to 9.9.9.9:853 gets through; after it, lookups work again.
+/// program (PowerShell) gets an answer from 9.9.9.9; with it - after it was
+/// damaged twice and repaired - its lookup and its DNS-over-TLS connection
+/// are refused while the guard's own connection to 9.9.9.9:853 gets
+/// through; after it, lookups work again.
 #[cfg(windows)]
 fn windows_dns_block_test() -> Result<(), String> {
     use std::time::Duration;
@@ -1352,6 +1353,19 @@ fn windows_dns_block_test() -> Result<(), String> {
     let during = (|| -> Result<(), String> {
         if !firewall::dns_capture_active()? {
             return Err("the DNS block isn't there after adding it".into());
+        }
+        // damage it the way another program could (review F-03): a missing
+        // rule, and an extra permit in its sublayer, must both be noticed and
+        // repaired - the probes below then run against the repaired block
+        for (how, what) in [(0u8, "a deleted IPv6 port-853 rule"), (1, "an extra permit-all in its sublayer")] {
+            firewall::dns_block_damage_for_test(how)?;
+            if firewall::dns_capture_active()? {
+                return Err(format!("{what} was NOT noticed"));
+            }
+            firewall::dns_capture(true)?;
+            if !firewall::dns_capture_active()? {
+                return Err(format!("the DNS block wasn't repaired after {what}"));
+            }
         }
         if ps(&lookup("example.net")) {
             return Err("a program's own lookup at 9.9.9.9 was NOT blocked".into());

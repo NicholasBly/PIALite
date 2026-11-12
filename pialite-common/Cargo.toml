@@ -1,6 +1,6 @@
 [package]
 name = "pialite-common"
-version = "0.9.6"
+version = "0.9.7"
 edition = "2021"
 description = "Shared code for the PIA Lite tray and guard: piactl runner, guard status types, IPC client"
 license = "GPL-3.0-or-later"

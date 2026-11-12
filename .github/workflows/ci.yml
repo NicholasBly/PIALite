@@ -23,6 +23,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: "1.97.0" # = rust-toolchain.toml
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: System packages
@@ -34,9 +35,13 @@ jobs:
       - name: Tests
         run: cargo test --workspace
       - name: Release build
-        run: cargo build --release
+        run: |
+          rustc -V
+          cargo build --release
       - name: Firewall self-test (real nftables, in its own network namespace)
         run: sudo unshare --net ./target/release/pialite-guard selftest-firewall
+      - name: install.sh --uninstall never says "removed" unchecked (fake nft/systemctl)
+        run: sudo sh tests/install-sh-uninstall.sh
       - name: Packages (.deb, .rpm, .tar.gz)
         run: packaging/linux/build-packages.sh "$(grep -m1 '^version' pialite-guard/Cargo.toml | cut -d'"' -f2)"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -53,7 +58,10 @@ jobs:
           getent hosts example.com
           sudo pialite-guard test-dns
           pialite-guard adapter-dns
+      # live third-party servers: on pushes and releases, not on pull requests
+      # (an outage there shouldn't fail an unrelated change)
       - name: Every built-in DNS provider answers (live)
+        if: github.event_name != 'pull_request'
         run: |
           for p in cloudflare adguard google quad9; do
             echo "== $p"
@@ -83,6 +91,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: "1.97.0" # = rust-toolchain.toml
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Clippy
@@ -90,7 +99,9 @@ jobs:
       - name: Tests
         run: cargo test --workspace
       - name: Release build
-        run: cargo build --release
+        run: |
+          rustc -V
+          cargo build --release
       - name: Firewall self-test (real Windows Filtering Platform)
         run: .\target\release\pialite-guard.exe selftest-firewall
       - name: DNS conflict check reads this machine's adapters

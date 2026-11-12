@@ -2,6 +2,37 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.7] - 2026-11-12
+
+Fixes from the independent v0.9.6 review (F-01 .. F-10).
+
+### Fixed
+- **setup checks the running guard is the one it just installed** (F-01): this version, the block mode just saved
+  (exactly - Always asked and Off running is a failure, so is a stronger mode than asked), and that mode's block
+  in place. Before, a guard reporting Off passed whatever was asked.
+- **Teardown keeps the PC usable if a step fails** (F-02): the DNS redirect is removed (and checked) first, then
+  the block - boot unit, saved rules, and the live rules last. If any step fails, the guard is started again, so
+  its block and DNS are back as before, and the message says what state the PC is in.
+- **Windows DNS block: every rule is checked, not just its sublayer** (F-03): each rule by its id (layer,
+  sublayer, action, weight, flags, every condition) and nothing extra in the sublayer. A damaged block is
+  reported as not on and rebuilt. The Windows firewall self-test deletes a rule and adds a stray permit, and
+  expects both to be noticed and repaired.
+- **Linux: "systemd couldn't be asked" is not "stopped"** (F-04): teardown stops instead of touching the firewall.
+- **Programs that setup/teardown run are stopped with everything they started** (F-05): own process group (Linux)
+  / job object (Windows), killed as a whole at the time limit; a program it started that keeps the output open
+  no longer makes the wait endless. The limit now counts from before the program starts.
+- **Linux data files** (F-06): settings and records are created 0600 whatever the umask (install.json stays 0644
+  for the tray); setup refuses links and hard-linked files in the data folder and gives everything in it to root,
+  with no write access for others.
+- **Windows: links, junctions and mount points** anywhere on the guard program's path are refused (F-07).
+- **install.sh --uninstall says "removed" only when it could check** (F-08): nft or systemd missing or not
+  answering is "can't check", not "nothing left"; unit files count; the check runs before the last program that
+  could remove the rules is deleted. A test with fake nft/systemctl covers it in CI.
+
+### Changed
+- The Rust version is pinned (`rust-toolchain.toml`, 1.97.0) and printed in the build logs; live DNS-provider
+  probes run on pushes and releases, not on pull requests (F-10).
+
 ## [0.9.6] - 2026-11-12
 
 Fixes from the independent v0.9.5 review (V95-xx).

@@ -18,21 +18,44 @@ fi
 
 # Is anything of PIA Lite's still active in the system? (rules, saved boot
 # rules, units) - printed, so the user sees what is left.
+#   returns 0 = something is left, 1 = checked: nothing left,
+#           2 = could NOT check (that is never "nothing left" - review F-08)
 leftovers() {
     found=1
+    if ! command -v nft >/dev/null 2>&1; then
+        echo "  ? nftables (nft) is not installed - the firewall rules can't be checked" >&2; return 2
+    fi
+    if ! tables=$(nft list tables 2>&1); then
+        echo "  ? the firewall rules can't be read: $tables" >&2; return 2
+    fi
     for t in pialite pialite_dns; do
-        if command -v nft >/dev/null 2>&1 && nft list table inet "$t" >/dev/null 2>&1; then
+        if printf '%s\n' "$tables" | grep -qx "table inet $t"; then
             echo "  - nftables table inet $t"; found=0
         fi
     done
-    [ -f /var/lib/pialite/firewall.nft ] && { echo "  - saved boot rules /var/lib/pialite/firewall.nft"; found=0; }
-    if systemctl is-enabled pialite-guard.service >/dev/null 2>&1 || systemctl is-active pialite-guard.service >/dev/null 2>&1; then
-        echo "  - the guard service pialite-guard.service (enabled or running)"; found=0
+    [ -e /var/lib/pialite/firewall.nft ] && { echo "  - saved boot rules /var/lib/pialite/firewall.nft"; found=0; }
+    for d in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+        for u in pialite-guard.service pialite-boot.service; do
+            [ -e "$d/$u" ] && { echo "  - unit file $d/$u"; found=0; }
+        done
+    done
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "  ? systemd (systemctl) is not available - the services can't be checked" >&2; return 2
     fi
-    # the boot unit stays "active" after its one run at boot: only enabled counts
-    if systemctl is-enabled pialite-boot.service >/dev/null 2>&1; then
-        echo "  - the boot unit pialite-boot.service (enabled)"; found=0
-    fi
+    for u in pialite-guard.service pialite-boot.service; do
+        # "inactive"/"failed" = not running; anything else, or no answer, counts
+        state=$(systemctl show --property=ActiveState --value "$u" 2>&1) || {
+            echo "  ? systemd can't be asked about $u: $state" >&2; return 2
+        }
+        enabled=$(systemctl is-enabled "$u" 2>/dev/null || true)
+        case "$enabled" in enabled|enabled-runtime|static|linked|linked-runtime|alias|indirect|generated|transient)
+            echo "  - $u is $enabled"; found=0 ;;
+        esac
+        # the boot unit stays "active" after its one run at boot: only its being enabled counts
+        if [ "$u" = pialite-guard.service ] && [ "$state" != inactive ] && [ "$state" != failed ]; then
+            echo "  - $u is $state"; found=0
+        fi
+    done
     return $found
 }
 
@@ -40,7 +63,19 @@ by_hand() {
     echo "By hand (as root), then run this again:" >&2
     echo "  systemctl disable --now pialite-guard.service pialite-boot.service" >&2
     echo "  nft delete table inet pialite; nft delete table inet pialite_dns" >&2
-    echo "  rm -f /var/lib/pialite/firewall.nft" >&2
+    echo "  rm -f /var/lib/pialite/firewall.nft /etc/systemd/system/pialite-guard.service /etc/systemd/system/pialite-boot.service" >&2
+}
+
+# 0 when it is checked that nothing is left; otherwise explains and returns 1
+verified_clean() {
+    rc=0; leftovers || rc=$?
+    case $rc in
+        1) return 0 ;;
+        2) echo "PIA Lite can't check that its firewall rules and services are gone (see above) - nothing more is removed." >&2 ;;
+        *) echo "These are still active (listed above)." >&2 ;;
+    esac
+    by_hand
+    return 1
 }
 
 uninstall() {
@@ -49,25 +84,19 @@ uninstall() {
             echo "Could not remove the block rules - run: sudo $PREFIX/bin/pialite-guard unlock" >&2
             exit 1
         }
-    elif leftovers; then
-        # the program that removes them is gone: never report a clean removal
-        # with rules still in place (review V95-05) - nothing is deleted here
-        echo "PIA Lite's program ($PREFIX/bin/pialite-guard) is missing, but these are still active (listed above)." >&2
-        echo "Easiest: extract the same PIA Lite version again and run its install.sh --uninstall." >&2
-        by_hand
-        exit 1
+    else
+        echo "PIA Lite's program ($PREFIX/bin/pialite-guard) is missing - checking what is left..." >&2
+        echo "(Easiest if anything is: extract the same PIA Lite version again and run its install.sh --uninstall.)" >&2
     fi
+    # checked BEFORE the last program that could remove them is deleted:
+    # never "removed" with rules or services still there, or unchecked
+    verified_clean || exit 1
     rm -f /usr/local/bin/pialite-tray /usr/local/bin/pialite-guard
     rm -f /usr/local/share/applications/pialite.desktop
     rm -f /usr/local/share/icons/hicolor/scalable/apps/pialite.svg
     rm -f /etc/xdg/autostart/pialite-tray.desktop
     rm -rf "$PREFIX"
     systemctl daemon-reload >/dev/null 2>&1 || true
-    if leftovers; then
-        echo "PIA Lite's files are removed, but the items above are still active." >&2
-        by_hand
-        exit 1
-    fi
     echo "PIA Lite removed."
 }
 

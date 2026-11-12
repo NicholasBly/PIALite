@@ -29,10 +29,18 @@ pub fn run(prog: &str, args: &[&str]) -> Result<(bool, String), String> {
 /// the program never blocks on a full pipe).
 const RUN_OUTPUT_MAX: usize = 256 * 1024;
 
-/// `run` with its own time limit (package installs get longer).
+/// `run` with its own time limit (package installs get longer). The limit
+/// covers the whole run, from before the program starts until its output is
+/// in (review F-05): a program it starts that keeps the output pipe open, or
+/// runs past the limit, is stopped with it - the program runs in its own
+/// process group (Linux) / job object (Windows), and the whole group is
+/// killed. (Windows: something started before the program is put into its job
+/// - a few microseconds - isn't covered.)
 pub fn run_within(prog: &str, args: &[&str], limit: Duration) -> Result<(bool, String), String> {
     use std::io::Read;
     use std::process::Stdio;
+    use std::sync::mpsc;
+    let until = Instant::now() + limit;
     let mut c = Command::new(prog);
     c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
@@ -40,8 +48,28 @@ pub fn run_within(prog: &str, args: &[&str], limit: Duration) -> Result<(bool, S
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+    }
     let mut child = c.spawn().map_err(|e| format!("{prog}: {e}"))?;
-    let drain = |r: Option<Box<dyn Read + Send>>| {
+    #[cfg(windows)]
+    let job = Job::for_child(&child);
+    let kill_all = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let Some(j) = &job {
+            j.kill();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let (tx, rx) = mpsc::channel::<(usize, Vec<u8>)>();
+    let drain = |i: usize, r: Option<Box<dyn Read + Send>>, tx: mpsc::Sender<(usize, Vec<u8>)>| {
         std::thread::spawn(move || {
             let mut kept = Vec::new();
             if let Some(mut r) = r {
@@ -54,27 +82,71 @@ pub fn run_within(prog: &str, args: &[&str], limit: Duration) -> Result<(bool, S
                     kept.extend_from_slice(&buf[..n.min(room)]);
                 }
             }
-            kept
-        })
+            let _ = tx.send((i, kept));
+        });
     };
-    let out = drain(child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
-    let err = drain(child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
-    let until = Instant::now() + limit;
+    drain(0, child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>), tx.clone());
+    drain(1, child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>), tx);
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st,
             Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_all(&mut child);
                 return Err(format!("{prog} did not finish within {} s and was stopped", limit.as_secs()));
             }
             Err(e) => return Err(format!("{prog}: {e}")),
         }
     };
-    let mut text = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
-    text.push_str(&String::from_utf8_lossy(&err.join().unwrap_or_default()));
+    // its output - bounded too: a program it started may still hold the pipe
+    let mut out: [Option<Vec<u8>>; 2] = [None, None];
+    while out.iter().any(Option::is_none) {
+        match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            Ok((i, v)) => out[i] = Some(v),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                kill_all(&mut child);
+                return Err(format!(
+                    "{prog} finished, but a program it started still held its output after {} s - stopped",
+                    limit.as_secs()
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let [o, e] = out;
+    let mut text = String::from_utf8_lossy(&o.unwrap_or_default()).into_owned();
+    text.push_str(&String::from_utf8_lossy(&e.unwrap_or_default()));
     Ok((status.success(), text))
+}
+
+/// Windows: a job object holding a program and everything it starts, so a
+/// timeout can stop all of them. No kill-on-close: what a program started on
+/// purpose (e.g. an elevated window) keeps running after a normal finish.
+#[cfg(windows)]
+struct Job(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Job {
+    fn for_child(child: &std::process::Child) -> Option<Job> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if h.is_null() {
+            return None;
+        }
+        let job = Job(h);
+        (unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as _) } != 0).then_some(job)
+    }
+    fn kill(&self) {
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Job {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -200,7 +272,28 @@ fn unit_present() -> bool {
 
 #[cfg(not(windows))]
 pub fn service_running() -> bool {
-    systemctl(&["is-active", "--quiet", SERVICE]).map(|(ok, _)| ok).unwrap_or(false)
+    service_state().unwrap_or(false)
+}
+
+/// Is the guard running? Err when systemd couldn't be asked - that is NOT
+/// "stopped" (review F-04): nothing may touch the firewall on a guess.
+#[cfg(not(windows))]
+pub fn service_state() -> Result<bool, String> {
+    let (ok, out) = systemctl(&["show", "--property=ActiveState", "--value", SERVICE])?;
+    active_state(ok, &out)
+}
+
+/// `systemctl show -p ActiveState --value` -> running?
+#[cfg_attr(windows, allow(dead_code))]
+pub fn active_state(ok: bool, out: &str) -> Result<bool, String> {
+    if !ok {
+        return Err(format!("systemd could not be asked about the guard service: {}", out.trim()));
+    }
+    match out.trim() {
+        "inactive" | "failed" => Ok(false),
+        "active" | "activating" | "deactivating" | "reloading" | "refreshing" => Ok(true),
+        other => Err(format!("unexpected state of the guard service: '{other}'")),
+    }
 }
 
 /// Stop the guard and wait until systemd says it is no longer running; a
@@ -213,17 +306,17 @@ pub fn stop_service() -> Result<(), String> {
         return Ok(());
     }
     let (ok, out) = systemctl(&["stop", SERVICE])?;
-    stopped_or_why(ok, &out, service_running, Duration::from_secs(30))
+    stopped_or_why(ok, &out, service_state, Duration::from_secs(30))
 }
 
 /// `systemctl stop` said `ok`; is the service really down within `limit`?
 #[cfg_attr(windows, allow(dead_code))]
-pub fn stopped_or_why(ok: bool, out: &str, running: impl Fn() -> bool, limit: Duration) -> Result<(), String> {
+pub fn stopped_or_why(ok: bool, out: &str, running: impl Fn() -> Result<bool, String>, limit: Duration) -> Result<(), String> {
     if !ok {
         return Err(format!("could not stop the guard service ({}) - nothing was changed; try again, or reboot first", out.trim()));
     }
     let until = Instant::now() + limit;
-    while running() {
+    while running().map_err(|e| format!("{e} - nothing was changed"))? {
         if Instant::now() >= until {
             return Err(format!("the guard service is still running after {} s - nothing was changed", limit.as_secs()));
         }
@@ -327,7 +420,7 @@ pub fn remove_service() -> Result<(), String> {
             return Err(format!("systemctl disable {unit}: {}", out.trim()));
         }
     }
-    if service_running() {
+    if service_state()? {
         return Err("the guard service is still running after disabling it".into());
     }
     // only the units we wrote ourselves (packages remove their own)
@@ -531,18 +624,35 @@ pub fn lock_down(path: &Path) -> Result<(), String> {
 }
 
 /// Nobody but SYSTEM / Administrators / TrustedInstaller can replace `file`
-/// (if given) or anything in `dir`, or move `dir` or a folder above it away
-/// (Err names who could). The service runs `file` as SYSTEM.
+/// (if given) or anything in `dir`, or move `dir` or a folder above it away,
+/// and none of them is a link, junction or mount point (Err names what is
+/// wrong). The service runs `file` as SYSTEM.
 #[cfg(windows)]
 pub fn only_admins_can_change(dir: &Path, file: Option<&Path>) -> Result<(), String> {
     let mut problems = vec![];
-    let mut look = |p: &Path, rights: u32, check_owner: bool| match read_acl(p) {
-        Ok((owner, dacl)) => {
-            for who in untrusted_writers(&owner, dacl.as_deref(), rights, check_owner) {
-                problems.push(format!("{}: {who}", p.display()));
+    let mut look = |p: &Path, rights: u32, check_owner: bool| {
+        // a junction, mount point or link anywhere on the way could point
+        // the service somewhere else later: refused outright (review F-07)
+        use std::os::windows::fs::MetadataExt;
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.file_attributes() & 0x400 != 0 => {
+                problems.push(format!("{} is a link or junction (reparse point)", p.display()));
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                problems.push(format!("{}: {e}", p.display()));
+                return;
             }
         }
-        Err(e) => problems.push(e),
+        match read_acl(p) {
+            Ok((owner, dacl)) => {
+                for who in untrusted_writers(&owner, dacl.as_deref(), rights, check_owner) {
+                    problems.push(format!("{}: {who}", p.display()));
+                }
+            }
+            Err(e) => problems.push(e),
+        }
     };
     if let Some(f) = file {
         look(f, REPLACE_RIGHTS, true);
@@ -605,12 +715,46 @@ pub fn protect_data_dir() -> Result<PathBuf, String> {
             }
         }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
-        let cfg = dir.join("guard.json");
-        if cfg.is_file() {
-            std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-        }
+        harden_data_files(&dir)?;
     }
     Ok(dir)
+}
+
+/// Linux: what is already in the data folder before it is trusted (review
+/// F-06) - no links, no extra hard-linked names, everything owned by root,
+/// nothing writable by others; settings and records readable by root only.
+/// (The tray reads install.json; guard.log and the CA certificate are
+/// public.) One level: the folder holds files and the updates folder.
+#[cfg(not(windows))]
+pub fn harden_data_files(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    const SECRET: [&str; 5] = ["guard.json", "guard.json.bak", "guard.json.broken", "hotel-recovery.json", "firewall.nft"];
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let p = entry.path();
+        let m = std::fs::symlink_metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if m.file_type().is_symlink() {
+            return Err(format!("{} is a link - PIA Lite never follows those; remove it and run setup again", p.display()));
+        }
+        if m.is_file() && m.nlink() > 1 {
+            return Err(format!("{} has other names (hard links) - remove it and run setup again", p.display()));
+        }
+        if m.uid() != 0 || m.gid() != 0 {
+            std::os::unix::fs::lchown(&p, Some(0), Some(0)).map_err(|e| format!("{}: could not give it to root: {e}", p.display()))?;
+        }
+        let mode = m.mode() & 0o7777;
+        let name = entry.file_name();
+        let want = if m.is_file() && SECRET.iter().any(|s| name == *s) {
+            0o600
+        } else {
+            mode & !0o022 & !0o6000 // no write for others, no setuid/setgid
+        };
+        if mode != want {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(want)).map_err(|e| format!("{}: {e}", p.display()))?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------- install record
@@ -641,7 +785,17 @@ pub fn write_record(r: &InstallRecord) -> Result<(), String> {
     let text = serde_json::to_string_pretty(r).map_err(|e| e.to_string())?;
     let p = record_path();
     let tmp = p.with_extension("tmp");
-    std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &p)).map_err(|e| format!("{}: {e}", p.display()))
+    let write = || -> std::io::Result<()> {
+        std::fs::write(&tmp, &text)?;
+        // the tray (an ordinary user) reads it: 0644, whatever the umask
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+        }
+        std::fs::rename(&tmp, &p)
+    };
+    write().map_err(|e| format!("{}: {e}", p.display()))
 }
 
 pub fn read_record() -> Option<InstallRecord> {
