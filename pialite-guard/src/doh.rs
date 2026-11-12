@@ -172,15 +172,23 @@ pub fn https_get(addr: SocketAddr, host: &str, path: &str) -> Result<http::Reply
     http::get(&mut s, host, path)
 }
 
-/// HTTPS GET by host name (resolved by the system), for update checks and
-/// downloads: bodies up to `max_body`, 120 s at most in total.
+/// HTTPS GET by host name, for update checks and downloads: bodies up to
+/// `max_body`; connecting and the transfer take 120 s at most in total. The
+/// system's name lookup before it is not covered by that limit (review V95-10:
+/// the standard library's lookup can't be interrupted) - it has the system's
+/// own resolver timeouts.
 pub fn https_get_url(host: &str, path: &str, max_body: usize) -> Result<http::Reply, String> {
     use std::net::ToSocketAddrs;
-    let until = Instant::now() + Duration::from_secs(120);
     let addrs: Vec<SocketAddr> = (host, 443).to_socket_addrs().map_err(|e| format!("looking up {host}: {e}"))?.collect();
+    let until = Instant::now() + Duration::from_secs(120);
     let mut last = format!("no address for {host}");
     for addr in addrs {
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+        // each attempt only gets what is left of the 120 s
+        let left = until.saturating_duration_since(Instant::now()).min(Duration::from_secs(10));
+        if left.is_zero() {
+            return Err(format!("{host}: no connection within 120 s ({last})"));
+        }
+        match TcpStream::connect_timeout(&addr, left) {
             Ok(tcp) => {
                 let mut sock = Sock::new(tcp, Duration::from_secs(30));
                 sock.arm(until);

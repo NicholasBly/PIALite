@@ -63,7 +63,8 @@ Checks:
                                          --canary (NextDNS): a domain on your Denylist proves YOUR profile
   pialite-guard test-doh [PROFILE]       talk to the DNS provider directly, without the proxy
   pialite-guard pipe-selftest            (Windows) check the control pipe's protections (run NOT as admin)
-  pialite-guard selftest-firewall        (admin) install, check and remove real block rules
+  pialite-guard selftest-firewall        (admin) install, check and remove real block rules - test machines only
+                                         (refuses where PIA Lite is set up; --force)
                                          (Linux: only inside a test network namespace)
   pialite-guard set-profile ID [NAME]    (admin) NextDNS profile (+ device name)
   pialite-guard set-users ID[,ID..]      (admin) accounts allowed to control the guard
@@ -248,10 +249,11 @@ fn pretty_status(s: &GuardStatus) -> String {
         match s.dns_only_guard {
             Some(true) if cfg!(windows) => "Other DNS      : blocked - every lookup goes through the guard".to_string(),
             Some(true) => "Other DNS      : redirected to the guard".to_string(),
-            Some(false) if cfg!(windows) => {
-                "Other DNS      : not blocked (only while the VPN is connected and PIA's DNS points at the guard)".to_string()
-            }
-            Some(false) => "Other DNS      : not redirected (the DNS proxy isn't listening)".to_string(),
+            Some(false) => format!(
+                "Other DNS      : NOT {} - {}",
+                if cfg!(windows) { "blocked" } else { "redirected" },
+                if s.dns_only_guard_note.is_empty() { "not known yet" } else { &s.dns_only_guard_note }
+            ),
             None => String::new(),
         },
         format!(
@@ -1245,7 +1247,10 @@ fn selftest_firewall(force: bool) -> Result<(), String> {
             return Err("run it in a test network namespace: sudo unshare --net pialite-guard selftest-firewall".into());
         }
     }
-    let _ = force;
+    // Windows has no separate network namespace: refuse to rewrite a real
+    // install's rules (review V95-04) - checked before anything is changed
+    #[cfg(windows)]
+    selftest_allowed(sys::service_installed(), firewall::installed(), force)?;
     let mut fails = 0;
     let mut check = |what: &str, r: Result<(), String>| match r {
         Ok(()) => println!("PASS: {what}"),
@@ -1298,6 +1303,26 @@ fn selftest_firewall(force: bool) -> Result<(), String> {
         println!("all firewall checks passed");
         Ok(())
     }
+}
+
+/// The firewall self-test replaces PIA Lite's rules and opens the internet for
+/// a moment: only on a machine where PIA Lite isn't set up (a CI runner), or
+/// with --force.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn selftest_allowed(service: bool, rules: Result<bool, String>, force: bool) -> Result<(), String> {
+    if force {
+        return Ok(());
+    }
+    let why = match (service, rules) {
+        (true, _) => "PIA Lite's guard service is set up on this PC".to_string(),
+        (false, Ok(true)) => "PIA Lite's block rules are in this PC's firewall".to_string(),
+        (false, Err(e)) => format!("this PC's firewall rules could not be checked ({e})"),
+        (false, Ok(false)) => return Ok(()),
+    };
+    Err(format!(
+        "{why} - the self-test would replace them and open the internet for a moment. It is meant for test machines \
+         (CI); add --force to run it here anyway. Nothing was changed."
+    ))
 }
 
 /// Windows, with the temporary allow-all in place: before the DNS block a
@@ -1525,6 +1550,16 @@ mod tests {
         let w = want_from_status(&st).unwrap();
         assert!(rule_checks(&w, false, true, ok, ok).iter().any(|(_, r)| r.is_err()), "Off with leftover boot-time rules: a difference");
         assert_eq!(want_from_status(&GuardStatus::default()), None, "an older guard doesn't say what it wants");
+    }
+
+    #[test]
+    fn selftest_refuses_a_real_install() {
+        // review V95-04: decided before any rule is touched
+        assert!(super::selftest_allowed(false, Ok(false), false).is_ok(), "a clean test machine");
+        assert!(super::selftest_allowed(true, Ok(false), false).unwrap_err().contains("guard service is set up"));
+        assert!(super::selftest_allowed(false, Ok(true), false).unwrap_err().contains("Nothing was changed"));
+        assert!(super::selftest_allowed(false, Err("engine".into()), false).unwrap_err().contains("could not be checked"));
+        assert!(super::selftest_allowed(true, Ok(true), true).is_ok(), "--force");
     }
 
     #[test]

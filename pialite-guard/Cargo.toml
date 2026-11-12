@@ -1,6 +1,6 @@
 [package]
 name = "pialite-guard"
-version = "0.9.5"
+version = "0.9.6"
 edition = "2021"
 description = "PIA Lite guard service: kill switch, encrypted DNS (DoH) proxy, hotel Wi-Fi login, setup and updates"
 license = "GPL-3.0-or-later"

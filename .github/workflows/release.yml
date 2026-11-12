@@ -1,10 +1,11 @@
 name: Release
 
 # A new version on main publishes itself: when the version in Cargo.toml has
-# no GitHub release yet (or a tag vX.Y.Z is pushed), the Windows and Linux
-# files are built and tested, SHA256SUMS is signed (if the
-# RELEASE_SIGNING_KEY secret is set), and the release - with its tag - is
-# published. Pushes that don't change the version stop after one quick check.
+# no GitHub release yet (or a tag vX.Y.Z is pushed), the whole CI workflow
+# runs (ci.yml: tests, firewall self-tests, packages, real install/uninstall);
+# only if all of it passes are its packages published, with SHA256SUMS signed
+# (if the RELEASE_SIGNING_KEY secret is set). Pushes that don't change the
+# version stop after one quick check.
 
 on:
   push:
@@ -13,7 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
@@ -29,7 +30,7 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       release: ${{ steps.v.outputs.release }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - id: v
         env:
           GH_TOKEN: ${{ github.token }}
@@ -47,67 +48,39 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  windows:
+  # the whole CI workflow: format, clippy, tests, real firewall self-tests,
+  # packages, a real install / uninstall on both systems - the release
+  # publishes exactly the packages it built and installed (review V95-13)
+  ci:
     needs: check
     if: needs.check.outputs.release == 'true'
-    runs-on: windows-latest
-    env:
-      VERSION: ${{ needs.check.outputs.version }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-      - run: cargo build --release
-      - name: Firewall self-test (real WFP)
-        run: .\target\release\pialite-guard.exe selftest-firewall
-      - name: WiX Toolset
-        run: |
-          dotnet tool install --global wix --version 5.0.2
-          wix extension add -g WixToolset.UI.wixext/5.0.2
-          wix extension add -g WixToolset.Util.wixext/5.0.2
-      - name: MSI and portable zip
-        shell: pwsh
-        run: |
-          ./packaging/windows/build.ps1 -Version $env:VERSION
-          wix msi validate (Get-Item dist\*.msi).FullName
-      - uses: actions/upload-artifact@v7
-        with:
-          name: windows
-          path: dist/*
-
-  linux:
-    needs: check
-    if: needs.check.outputs.release == 'true'
-    runs-on: ubuntu-24.04
-    env:
-      VERSION: ${{ needs.check.outputs.version }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig1-dev nftables rpm iproute2
-      - run: cargo test --workspace
-      - run: cargo build --release
-      - name: Firewall self-test (real nftables)
-        run: sudo unshare --net ./target/release/pialite-guard selftest-firewall
-      - run: packaging/linux/build-packages.sh "$VERSION"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: linux
-          path: dist/*
+    uses: ./.github/workflows/ci.yml
 
   publish:
-    needs: [check, windows, linux]
+    needs: [check, ci]
     runs-on: ubuntu-24.04
+    # only this job may write (creates the release and its tag)
+    permissions:
+      contents: write
     env:
       VERSION: ${{ needs.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
+          name: linux-packages
           path: dist
-          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: windows-packages
+          path: dist
+      - name: Exactly the expected files, with this version
+        run: |
+          v="$VERSION"
+          printf '%s\n' "PIALite-$v-linux-x86_64.tar.gz" "PIALite-$v-windows-x64-portable.zip" "PIALite-$v-windows-x64.msi" \
+            "pialite-$v-1.x86_64.rpm" "pialite_${v}_amd64.deb" | sort > want.txt
+          ls dist | sort > have.txt
+          diff -u want.txt have.txt
       - name: Checksums
         run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
       - name: Sign the checksums (the updater installs only signed releases)
@@ -116,6 +89,7 @@ jobs:
         run: |
           if [ -z "$RELEASE_SIGNING_KEY" ]; then
             echo "::warning::RELEASE_SIGNING_KEY is not set - this release is NOT signed; the updater will only point to the download page"
+            echo "unsigned" > "$RUNNER_TEMP/unsigned"
             exit 0
           fi
           umask 077
@@ -140,7 +114,11 @@ jobs:
             echo "| Fedora / openSUSE / RHEL | \`pialite-$v-1.x86_64.rpm\` |"
             echo "| Any Linux (install.sh or portable) | \`PIALite-$v-linux-x86_64.tar.gz\` |"
             echo
-            echo "Checksums: \`SHA256SUMS\` (signed: \`SHA256SUMS.sig\`, ed25519 key in \`keys/release-signing.pub\`)."
+            if [ -f "$RUNNER_TEMP/unsigned" ]; then
+              echo "Checksums: \`SHA256SUMS\`. **This release is not signed** - PIA Lite's built-in updater won't install it; download it here instead."
+            else
+              echo "Checksums: \`SHA256SUMS\` (signed: \`SHA256SUMS.sig\`, ed25519 key in \`keys/release-signing.pub\`)."
+            fi
           } >> notes.md
           cat notes.md
       - name: Publish

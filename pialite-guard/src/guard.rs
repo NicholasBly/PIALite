@@ -197,9 +197,19 @@ pub struct Guard {
     restore_pending: AtomicBool,
     restore_failing: AtomicBool,
     ticker: Mutex<Option<JoinHandle<()>>>,
-    /// Linux DNS redirect as last applied (None = not yet / to be redone).
+    /// The DNS block (Windows) / redirect (Linux) as last CONFIRMED: Some(on)
+    /// only after the firewall call succeeded; None = not known (not yet, or
+    /// the last add/remove/check failed) - then it is tried again and never
+    /// reported as on (review V95-01).
     dns_capture: Mutex<Option<bool>>,
+    /// Why it is not on right now, in plain words ("" = it is on / DNS off).
+    dns_capture_note: Mutex<String>,
+    /// After a failed add/remove: not before this (a bounded retry).
+    dns_capture_retry: Mutex<Option<Instant>>,
 }
+
+/// Wait between attempts after the DNS block/redirect could not be changed.
+const DNS_CAPTURE_RETRY: Duration = if cfg!(test) { Duration::from_millis(0) } else { Duration::from_secs(10) };
 
 fn resolver_for(cfg: &Config) -> Arc<dyn Resolve> {
     match Doh::from_config(cfg) {
@@ -276,6 +286,8 @@ impl Guard {
             pia_settings: Mutex::new(pia::read_settings()),
             ticker: Mutex::new(None),
             dns_capture: Mutex::new(None),
+            dns_capture_note: Mutex::new(String::new()),
+            dns_capture_retry: Mutex::new(None),
         });
         // left over from a hotel login before a restart: PIA's kill switch isn't trusted yet
         g.policy.lock().unwrap().set_strict(g.restore_pending.load(Ordering::Relaxed));
@@ -338,9 +350,11 @@ impl Guard {
             let _ = t.join(); // at most ~1 s
         }
         self.proxy.stop();
-        if self.dns_capture.lock().unwrap().is_some() {
-            // normal DNS while the guard is away (Linux; Windows: PIA's setting)
-            let _ = firewall::dns_capture(false);
+        if *self.dns_capture.lock().unwrap() != Some(false) {
+            // normal DNS while the guard is away (on, or not known to be off)
+            if let Err(e) = firewall::dns_capture(false) {
+                log(&format!("could not remove the DNS block/redirect while stopping: {e}"));
+            }
         }
         piactl::shutdown();
         log("guard stopped");
@@ -1058,41 +1072,79 @@ impl Guard {
         if !cfg!(any(test, target_os = "linux", windows)) {
             return;
         }
-        let want = self.cfg().features().dns
-            && self.proxy.stats.listening.load(Ordering::Relaxed)
-            && (!cfg!(windows) || crate::netif::vpn_dns_is_guard());
+        let dns = self.cfg().features().dns;
+        let listening = self.proxy.stats.listening.load(Ordering::Relaxed);
+        let vpn = if cfg!(windows) { crate::netif::vpn_dns_is_guard() } else { Some(true) };
+        let vpn_dns = vpn == Some(true);
+        let why_off = if !dns {
+            ""
+        } else if !listening {
+            "the DNS proxy isn't listening"
+        } else if vpn.is_none() {
+            "Windows' network adapters couldn't be read, so it isn't known whether Windows uses the guard"
+        } else if !vpn_dns {
+            "Windows isn't sending its lookups to the guard (VPN not connected, or PIA's DNS setting not applied yet - reconnect PIA)"
+        } else {
+            ""
+        };
+        self.apply_dns_capture(dns && listening && vpn_dns, recheck, why_off);
+    }
+
+    /// Bring the DNS block/redirect to `want`. The state counts only what
+    /// the firewall CONFIRMED: a failed add or remove leaves it "not known",
+    /// is shown in the status and is tried again after DNS_CAPTURE_RETRY.
+    fn apply_dns_capture(&self, want: bool, recheck: bool, why_off: &str) {
+        let what = if cfg!(windows) { "DNS block" } else { "DNS redirect" };
         let mut have = self.dns_capture.lock().unwrap();
+        let mut note = self.dns_capture_note.lock().unwrap();
         if recheck && *have == Some(true) {
             match firewall::dns_capture_active() {
                 Ok(true) => {}
                 Ok(false) => {
-                    log("the DNS redirect rules were missing - adding them again");
+                    log(&format!("the {what} rules were missing - adding them again"));
                     *have = None;
                 }
-                Err(e) => log(&format!("could not check the DNS redirect rules: {e}")),
+                Err(e) => {
+                    log(&format!("could not check the {what} rules: {e}"));
+                    *have = None; // not verified: not reported as on, and set again
+                    *note = format!("could not check the {what}: {e}");
+                }
             }
         }
         if *have == Some(want) {
+            *note = if want { String::new() } else { why_off.to_string() };
+            return;
+        }
+        let mut retry = self.dns_capture_retry.lock().unwrap();
+        if retry.is_some_and(|t| Instant::now() < t) {
             return;
         }
         let was = *have;
-        if let Err(e) = firewall::dns_capture(want) {
-            // logged once; a missing redirect is found again by the 30 s check
-            log(&format!("could not {} the DNS block/redirect: {e}", if want { "add" } else { "remove" }));
-        } else if want {
-            log(if cfg!(windows) {
-                "DNS to other servers is now blocked - lookups only go through the guard"
-            } else {
-                "plain DNS from programs now goes to the encrypted DNS proxy"
-            });
-        } else if was == Some(true) {
-            log(if cfg!(windows) {
-                "DNS block lifted (VPN not connected, or the proxy is not listening)"
-            } else {
-                "DNS redirect removed (the proxy is not listening)"
-            });
+        match firewall::dns_capture(want) {
+            Ok(()) => {
+                *have = Some(want);
+                *retry = None;
+                *note = if want { String::new() } else { why_off.to_string() };
+                if want {
+                    log(if cfg!(windows) {
+                        "DNS to other servers is now blocked - lookups only go through the guard"
+                    } else {
+                        "plain DNS from programs now goes to the encrypted DNS proxy"
+                    });
+                } else if was == Some(true) {
+                    log(&format!("{what} lifted ({})", if why_off.is_empty() { "encrypted DNS off" } else { why_off }));
+                }
+            }
+            Err(e) => {
+                let msg = format!("could not {} the {what}: {e}", if want { "add" } else { "remove" });
+                if *note != msg {
+                    log(&format!("{msg} - trying again in {} s", DNS_CAPTURE_RETRY.as_secs()));
+                }
+                *have = None;
+                *retry = Some(Instant::now() + DNS_CAPTURE_RETRY);
+                *note = msg;
+            }
         }
-        *have = Some(want);
     }
 
     /// PC going to sleep / waking up (incl. Fast Startup).
@@ -1501,6 +1553,7 @@ impl Guard {
             dns_provider: if cfg.features().dns { cfg.provider().to_string() } else { String::new() },
             dns_tls: cfg.features().dns && cfg.dot(),
             dns_only_guard: cfg.features().dns.then(|| *self.dns_capture.lock().unwrap() == Some(true)),
+            dns_only_guard_note: self.dns_capture_note.lock().unwrap().clone(),
             approved_accounts: cfg.allowed_sids.len() as u32,
             vpn_adapter,
             tunnel_watch,
@@ -2365,6 +2418,55 @@ esac
     /// 0.9: with encrypted DNS turned off nothing listens on port 53, and
     /// with hotel login turned off it can't be started; the status says
     /// which features run.
+    #[test]
+    fn dns_block_state_counts_only_what_the_firewall_confirmed() {
+        // review V95-01: a failed add/remove/check is never reported as "on",
+        // is visible in the status, and is tried again
+        let _g = ENV_LOCK.lock().unwrap();
+        let d = temp_data("dnsblock");
+        let mut c = Config { features: Some(config::Features { dns: true, hotel: true }), ..Default::default() };
+        c.set_provider("quad9", None).unwrap();
+        config::save(&c).unwrap();
+        TICK_PAUSED.store(true, Ordering::SeqCst);
+        let g = Guard::start_with(free_addr(), false);
+        let on = |g: &Guard| g.status().dns_only_guard;
+        // add fails: not on, the reason shown, nothing claimed
+        firewall::fail_dns_capture(true);
+        g.apply_dns_capture(true, false, "");
+        assert_eq!(on(&g), Some(false));
+        assert!(g.status().dns_only_guard_note.contains("could not add"), "{}", g.status().dns_only_guard_note);
+        // ...and tried again: works once the firewall takes it
+        firewall::fail_dns_capture(false);
+        g.apply_dns_capture(true, false, "");
+        assert_eq!(on(&g), Some(true));
+        assert!(firewall::dns_capture_active().unwrap());
+        assert_eq!(g.status().dns_only_guard_note, "");
+        // the 30 s check can't reach the firewall (and so can't set it again):
+        // no longer reported as on
+        firewall::fail_dns_inspect(true);
+        firewall::fail_dns_capture(true);
+        g.apply_dns_capture(true, true, "");
+        let st = g.status();
+        assert_eq!(st.dns_only_guard, Some(false), "unverified is not reported as on");
+        assert!(st.dns_only_guard_note.contains("could not"), "{}", st.dns_only_guard_note);
+        firewall::fail_dns_inspect(false);
+        firewall::fail_dns_capture(false);
+        // remove fails: still "not known", so the next call removes it
+        g.apply_dns_capture(true, false, "");
+        firewall::fail_dns_capture(true);
+        g.apply_dns_capture(false, false, "the DNS proxy isn't listening");
+        assert_eq!(on(&g), Some(false));
+        assert!(firewall::dns_capture_active().unwrap(), "the redirect is still there - and the guard knows it isn't sure");
+        assert!(g.status().dns_only_guard_note.contains("could not remove"));
+        firewall::fail_dns_capture(false);
+        g.apply_dns_capture(false, false, "the DNS proxy isn't listening");
+        assert!(!firewall::dns_capture_active().unwrap(), "removed on the retry");
+        assert_eq!(g.status().dns_only_guard_note, "the DNS proxy isn't listening");
+        TICK_PAUSED.store(false, Ordering::SeqCst);
+        g.shutdown();
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn optional_features_are_honoured() {
         let _g = ENV_LOCK.lock().unwrap();

@@ -19,6 +19,9 @@ pub const REPO: &str = "NicholasBly/PIALite";
 const PUBLIC_KEY: &str = include_str!("../../keys/release-signing.pub");
 const MAX_API: usize = 2 * 1024 * 1024;
 const MAX_ASSET: usize = 64 * 1024 * 1024;
+/// A package install (it runs setup, which waits for the guard) may take a while.
+#[cfg_attr(windows, allow(dead_code))]
+const PACKAGE_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Asset {
@@ -325,8 +328,8 @@ pub fn install_msi(file: &str, log: &str) -> Result<(), String> {
 fn install(kind: &str, file: &Path) -> Result<(), String> {
     let f = file.display().to_string();
     let (ok, out) = match kind {
-        "deb" => sys::run("dpkg", &["-i", &f])?,
-        "rpm" => sys::run("rpm", &["-U", "--replacepkgs", &f])?,
+        "deb" => sys::run_within("dpkg", &["-i", &f], PACKAGE_LIMIT)?,
+        "rpm" => sys::run_within("rpm", &["-U", "--replacepkgs", &f], PACKAGE_LIMIT)?,
         "tarball" => {
             let dir = file.parent().ok_or("no folder")?;
             let d = dir.display().to_string();
@@ -340,7 +343,7 @@ fn install(kind: &str, file: &Path) -> Result<(), String> {
                 .map(|e| e.path().join("install.sh"))
                 .find(|p| p.is_file())
                 .ok_or("install.sh not found in the update")?;
-            sys::run("sh", &[&script.display().to_string(), "--upgrade"])?
+            sys::run_within("sh", &[&script.display().to_string(), "--upgrade"], PACKAGE_LIMIT)?
         }
         _ => return Err(format!("can't install a {kind} update here")),
     };

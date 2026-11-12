@@ -148,6 +148,9 @@ pub struct GuardStatus {
     /// other servers is blocked; Linux - it is redirected to the proxy.
     /// None = an older guard / encrypted DNS off.
     pub dns_only_guard: Option<bool>,
+    /// Why it isn't on right now (or why it couldn't be changed/checked),
+    /// in plain words; "" = on, or encrypted DNS off.
+    pub dns_only_guard_note: String,
 }
 
 /// The guard's tunnel check, in words (GuardStatus::tunnel_watch).

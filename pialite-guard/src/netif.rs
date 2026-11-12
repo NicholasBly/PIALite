@@ -291,9 +291,10 @@ pub fn snapshot() -> Option<Snapshot> {
 /// adapters is up and has 127.0.0.1 among its DNS servers - PIA puts its DNS
 /// setting on its adapter when it connects (so a setting changed while
 /// connected only counts after a reconnect). The plain-DNS block waits for
-/// this, so it can never take DNS away from Windows.
+/// this, so it can never take DNS away from Windows. None = the adapters
+/// couldn't be read.
 #[cfg(all(windows, not(test)))]
-pub fn vpn_dns_is_guard() -> bool {
+pub fn vpn_dns_is_guard() -> Option<bool> {
     use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH,
@@ -311,7 +312,7 @@ pub fn vpn_dns_is_guard() -> bool {
             continue;
         }
         if rc != 0 {
-            return false;
+            return None;
         }
         let text = |p: *mut u16| -> String {
             if p.is_null() {
@@ -342,21 +343,21 @@ pub fn vpn_dns_is_guard() -> bool {
                     d = da.Next;
                 }
                 if dns_is_guard(&servers) {
-                    return true;
+                    return Some(true);
                 }
             }
             a = r.Next;
         }
-        return false;
+        return Some(false);
     }
-    false
+    None
 }
 
 /// Elsewhere: not used (Linux redirects plain DNS instead of blocking it).
 #[cfg(not(all(windows, not(test))))]
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn vpn_dns_is_guard() -> bool {
-    true
+pub fn vpn_dns_is_guard() -> Option<bool> {
+    Some(true)
 }
 
 /// One adapter's DNS servers point at the guard's proxy.

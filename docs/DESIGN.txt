@@ -467,3 +467,15 @@ What is protected, from what, and what is NOT claimed.
    selftest-firewall checks it on Windows: a child process's lookup at
    9.9.9.9 and its TCP connection to 9.9.9.9:853 are refused, the guard's
    own connection to 9.9.9.9:853 gets through, and lookups work again after.
+   0.9.6 (review V95): the DNS block/redirect state is what the firewall
+   confirmed (None after a failed add/remove/check: retried after 10 s,
+   never shown as on; the status carries the reason it is off). Linux
+   stop_service waits for "not running" and fails otherwise; teardown aborts
+   unless the DNS redirect is gone too. Windows folders: setup replaces the
+   whole DACL (protected; BA owner; SY+BA full, BU read) of the data folder
+   and a custom MSI folder, and refuses the SYSTEM service unless no other
+   account has replace rights on the program or its folder, move rights
+   (delete, delete child, write DAC/owner) on any folder above it, or owns
+   any of them (drive roots: owner not checked). setup fails when the guard
+   doesn't answer or the chosen block isn't armed within 30 s. Releases:
+   release.yml calls ci.yml (workflow_call) and publishes its artifacts.

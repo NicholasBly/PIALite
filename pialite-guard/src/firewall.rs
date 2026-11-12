@@ -453,12 +453,27 @@ mod stub {
         Ok(())
     }
     static DNS_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static DNS_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static DNS_INSPECT_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     pub fn dns_capture(on: bool) -> Result<(), String> {
+        if DNS_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("injected: the firewall refused the DNS rules".into());
+        }
         DNS_CAPTURE.store(on, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
     pub fn dns_capture_active() -> Result<bool, String> {
+        if DNS_INSPECT_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("injected: firewall engine not reachable".into());
+        }
         Ok(DNS_CAPTURE.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    /// Tests: every DNS block/redirect change fails / every check fails.
+    pub fn fail_dns_capture(on: bool) {
+        DNS_FAIL.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn fail_dns_inspect(on: bool) {
+        DNS_INSPECT_FAIL.store(on, std::sync::atomic::Ordering::SeqCst);
     }
     /// The block-everything floor (review FINAL-01): a persistent, unconditional
     /// block on BOTH IPv4 and IPv6, and nothing under PIA Lite's name that isn't
@@ -752,8 +767,14 @@ mod linux {
         if list(nft::TABLE)?.is_some() {
             nft(&["delete", "table", "inet", nft::TABLE], None)?;
         }
-        let _ = std::fs::remove_file(saved_path());
-        let _ = remove_boot();
+        // the boot unit off first: a failure leaves the saved rules, so
+        // installed() still says "present" (review V95-12)
+        remove_boot().map_err(|e| format!("could not disable the boot protection unit: {e}"))?;
+        match std::fs::remove_file(saved_path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", saved_path().display())),
+        }
         Ok(())
     }
 

@@ -16,12 +16,46 @@ if [ "$(id -u)" != 0 ]; then
     exit 1
 fi
 
+# Is anything of PIA Lite's still active in the system? (rules, saved boot
+# rules, units) - printed, so the user sees what is left.
+leftovers() {
+    found=1
+    for t in pialite pialite_dns; do
+        if command -v nft >/dev/null 2>&1 && nft list table inet "$t" >/dev/null 2>&1; then
+            echo "  - nftables table inet $t"; found=0
+        fi
+    done
+    [ -f /var/lib/pialite/firewall.nft ] && { echo "  - saved boot rules /var/lib/pialite/firewall.nft"; found=0; }
+    if systemctl is-enabled pialite-guard.service >/dev/null 2>&1 || systemctl is-active pialite-guard.service >/dev/null 2>&1; then
+        echo "  - the guard service pialite-guard.service (enabled or running)"; found=0
+    fi
+    # the boot unit stays "active" after its one run at boot: only enabled counts
+    if systemctl is-enabled pialite-boot.service >/dev/null 2>&1; then
+        echo "  - the boot unit pialite-boot.service (enabled)"; found=0
+    fi
+    return $found
+}
+
+by_hand() {
+    echo "By hand (as root), then run this again:" >&2
+    echo "  systemctl disable --now pialite-guard.service pialite-boot.service" >&2
+    echo "  nft delete table inet pialite; nft delete table inet pialite_dns" >&2
+    echo "  rm -f /var/lib/pialite/firewall.nft" >&2
+}
+
 uninstall() {
     if [ -x "$PREFIX/bin/pialite-guard" ]; then
         "$PREFIX/bin/pialite-guard" teardown || {
             echo "Could not remove the block rules - run: sudo $PREFIX/bin/pialite-guard unlock" >&2
             exit 1
         }
+    elif leftovers; then
+        # the program that removes them is gone: never report a clean removal
+        # with rules still in place (review V95-05) - nothing is deleted here
+        echo "PIA Lite's program ($PREFIX/bin/pialite-guard) is missing, but these are still active (listed above)." >&2
+        echo "Easiest: extract the same PIA Lite version again and run its install.sh --uninstall." >&2
+        by_hand
+        exit 1
     fi
     rm -f /usr/local/bin/pialite-tray /usr/local/bin/pialite-guard
     rm -f /usr/local/share/applications/pialite.desktop
@@ -29,6 +63,11 @@ uninstall() {
     rm -f /etc/xdg/autostart/pialite-tray.desktop
     rm -rf "$PREFIX"
     systemctl daemon-reload >/dev/null 2>&1 || true
+    if leftovers; then
+        echo "PIA Lite's files are removed, but the items above are still active." >&2
+        by_hand
+        exit 1
+    fi
     echo "PIA Lite removed."
 }
 

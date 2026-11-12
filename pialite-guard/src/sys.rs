@@ -18,19 +18,63 @@ pub const SERVICE: &str = "PiaLiteGuard";
 #[cfg(not(windows))]
 pub const SERVICE: &str = "pialite-guard.service";
 
-/// Run a program; (success, stdout+stderr).
+/// Run a program; (success, stdout+stderr). At most 2 minutes (review
+/// V95-10): a program that hangs is stopped and reported, so setup, teardown
+/// and the installers never wait forever.
 pub fn run(prog: &str, args: &[&str]) -> Result<(bool, String), String> {
+    run_within(prog, args, Duration::from_secs(120))
+}
+
+/// The most output kept from one program (the rest is read and dropped, so
+/// the program never blocks on a full pipe).
+const RUN_OUTPUT_MAX: usize = 256 * 1024;
+
+/// `run` with its own time limit (package installs get longer).
+pub fn run_within(prog: &str, args: &[&str], limit: Duration) -> Result<(bool, String), String> {
+    use std::io::Read;
+    use std::process::Stdio;
     let mut c = Command::new(prog);
-    c.args(args);
+    c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let out = c.output().map_err(|e| format!("{prog}: {e}"))?;
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    Ok((out.status.success(), text))
+    let mut child = c.spawn().map_err(|e| format!("{prog}: {e}"))?;
+    let drain = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            if let Some(mut r) = r {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = r.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let room = RUN_OUTPUT_MAX.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                }
+            }
+            kept
+        })
+    };
+    let out = drain(child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
+    let err = drain(child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
+    let until = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{prog} did not finish within {} s and was stopped", limit.as_secs()));
+            }
+            Err(e) => return Err(format!("{prog}: {e}")),
+        }
+    };
+    let mut text = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
+    text.push_str(&String::from_utf8_lossy(&err.join().unwrap_or_default()));
+    Ok((status.success(), text))
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -159,12 +203,33 @@ pub fn service_running() -> bool {
     systemctl(&["is-active", "--quiet", SERVICE]).map(|(ok, _)| ok).unwrap_or(false)
 }
 
+/// Stop the guard and wait until systemd says it is no longer running; a
+/// failed `systemctl stop` or a guard still running is an error - nothing
+/// after this may touch the firewall while the guard could put rules back
+/// (review V95-02).
 #[cfg(not(windows))]
 pub fn stop_service() -> Result<(), String> {
     if !unit_present() {
         return Ok(());
     }
-    systemctl(&["stop", SERVICE]).map(|_| ())
+    let (ok, out) = systemctl(&["stop", SERVICE])?;
+    stopped_or_why(ok, &out, service_running, Duration::from_secs(30))
+}
+
+/// `systemctl stop` said `ok`; is the service really down within `limit`?
+#[cfg_attr(windows, allow(dead_code))]
+pub fn stopped_or_why(ok: bool, out: &str, running: impl Fn() -> bool, limit: Duration) -> Result<(), String> {
+    if !ok {
+        return Err(format!("could not stop the guard service ({}) - nothing was changed; try again, or reboot first", out.trim()));
+    }
+    let until = Instant::now() + limit;
+    while running() {
+        if Instant::now() >= until {
+            return Err(format!("the guard service is still running after {} s - nothing was changed", limit.as_secs()));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -255,8 +320,16 @@ pub fn remove_service() -> Result<(), String> {
     if !unit_present() {
         return Ok(());
     }
-    let _ = systemctl(&["disable", "--now", SERVICE]);
-    let _ = systemctl(&["disable", "pialite-boot.service"]);
+    for args in [&["disable", "--now", SERVICE][..], &["disable", "pialite-boot.service"]] {
+        let unit = args[args.len() - 1];
+        let (ok, out) = systemctl(args)?;
+        if !ok && !out.contains("not loaded") && !out.contains("does not exist") && !out.contains("not found") {
+            return Err(format!("systemctl disable {unit}: {}", out.trim()));
+        }
+    }
+    if service_running() {
+        return Err("the guard service is still running after disabling it".into());
+    }
     // only the units we wrote ourselves (packages remove their own)
     for f in [SERVICE, "pialite-boot.service"] {
         let p = Path::new("/etc/systemd/system").join(f);
@@ -280,6 +353,214 @@ pub fn wait_for_guard(limit: Duration) -> Result<pialite_common::status::GuardSt
     }
 }
 
+// ------------------------------------------------------- who can change it
+
+/// Accounts that may change PIA Lite's program and data: SYSTEM,
+/// Administrators, TrustedInstaller (owns Program Files).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub const TRUSTED_WRITERS: [&str; 3] = ["S-1-5-18", "S-1-5-32-544", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"];
+/// Rights that let someone replace or take over a file or folder: write /
+/// add file, append / add folder, delete child, delete, change permissions,
+/// take ownership, generic all / write.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub const REPLACE_RIGHTS: u32 = 0x2 | 0x4 | 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000 | 0x4000_0000;
+/// Rights on a parent folder that let someone move it (or a folder in it)
+/// away and put another in its place: delete child, delete, change
+/// permissions, take ownership, generic all.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub const MOVE_RIGHTS: u32 = 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000;
+
+/// One entry of an access list, as far as the check needs it.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ace {
+    pub allow: bool,
+    /// Applies only to what is created inside, not to the object itself.
+    pub inherit_only: bool,
+    pub mask: u32,
+    pub sid: String,
+}
+
+/// Who besides SYSTEM / Administrators / TrustedInstaller could use `rights`
+/// on an object with this owner and access list (None = no list at all,
+/// which means everyone has full access). `check_owner`: an owner can always
+/// change the permissions (drive roots are not checked for that).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn untrusted_writers(owner: &str, dacl: Option<&[Ace]>, rights: u32, check_owner: bool) -> Vec<String> {
+    let mut v = vec![];
+    if check_owner && !TRUSTED_WRITERS.contains(&owner) {
+        v.push(format!("its owner {owner}"));
+    }
+    match dacl {
+        None => v.push("everyone (it has no access list)".into()),
+        Some(aces) => {
+            for a in aces.iter().filter(|a| a.allow && !a.inherit_only && a.mask & rights != 0) {
+                if !TRUSTED_WRITERS.contains(&a.sid.as_str()) {
+                    v.push(format!("{} (rights 0x{:x})", a.sid, a.mask));
+                }
+            }
+        }
+    }
+    v
+}
+
+/// Owner and access list of a file or folder, from Windows.
+#[cfg(windows)]
+pub fn read_acl(path: &Path) -> Result<(String, Option<Vec<Ace>>), String> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID,
+    };
+    struct Free(PSECURITY_DESCRIPTOR);
+    impl Drop for Free {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0 as _) };
+        }
+    }
+    let sid_text = |p: PSID| -> String {
+        let mut w: *mut u16 = null_mut();
+        if unsafe { ConvertSidToStringSidW(p, &mut w) } == 0 || w.is_null() {
+            return "an unreadable account".into();
+        }
+        let mut n = 0;
+        while unsafe { *w.add(n) } != 0 && n < 256 {
+            n += 1;
+        }
+        let t = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(w, n) });
+        unsafe { LocalFree(w as _) };
+        t
+    };
+    let name: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain(Some(0)).collect();
+    let (mut owner, mut dacl, mut sd): (PSID, *mut ACL, PSECURITY_DESCRIPTOR) = (null_mut(), null_mut(), null_mut());
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 {
+        return Err(format!("could not read the permissions of {} (error {rc})", path.display()));
+    }
+    let _free = Free(sd);
+    let owner = if owner.is_null() { "nobody".to_string() } else { sid_text(owner) };
+    if dacl.is_null() {
+        return Ok((owner, None));
+    }
+    let mut aces = vec![];
+    let count = unsafe { (*dacl).AceCount } as u32;
+    for i in 0..count {
+        let mut ace: *mut core::ffi::c_void = null_mut();
+        if unsafe { GetAce(dacl, i, &mut ace) } == 0 || ace.is_null() {
+            return Err(format!("could not read the permissions of {}", path.display()));
+        }
+        let h = unsafe { *(ace as *const ACE_HEADER) };
+        let inherit_only = h.AceFlags as u32 & INHERIT_ONLY_ACE != 0;
+        match h.AceType {
+            // ACCESS_ALLOWED / ACCESS_ALLOWED_CALLBACK: mask, then the SID
+            0 | 9 => {
+                let a = ace as *const ACCESS_ALLOWED_ACE;
+                let sid = unsafe { std::ptr::addr_of!((*a).SidStart) } as PSID;
+                aces.push(Ace { allow: true, inherit_only, mask: unsafe { (*a).Mask }, sid: sid_text(sid) });
+            }
+            // object "allow" entries don't belong on files: never trusted
+            5 | 11 => {
+                let mask = unsafe { (*(ace as *const ACCESS_ALLOWED_ACE)).Mask };
+                aces.push(Ace { allow: true, inherit_only, mask, sid: "an object access entry".into() });
+            }
+            _ => {} // deny / audit entries only take rights away
+        }
+    }
+    Ok((owner, Some(aces)))
+}
+
+/// Replace the owner (Administrators) and the WHOLE access list of `path`
+/// with SYSTEM + Administrators full, Users read - not inherited, nothing
+/// else kept (review V95-03: icacls /grant:r keeps other accounts' entries).
+#[cfg(windows)]
+pub fn lock_down(path: &Path) -> Result<(), String> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+    let sddl: Vec<u16> = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)".encode_utf16().chain(Some(0)).collect();
+    let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+    if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()) } == 0 {
+        return Err("could not build the access list".into());
+    }
+    let (mut owner, mut dacl): (PSID, *mut ACL) = (null_mut(), null_mut());
+    let (mut present, mut defaulted) = (0, 0);
+    let ok = unsafe {
+        GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) != 0
+            && GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) != 0
+    };
+    let name: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain(Some(0)).collect();
+    let rc = if ok {
+        unsafe {
+            SetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                owner,
+                null_mut(),
+                dacl,
+                null(),
+            )
+        }
+    } else {
+        u32::MAX
+    };
+    unsafe { LocalFree(sd as _) };
+    if rc != 0 {
+        return Err(format!("could not set the permissions of {} (error {rc})", path.display()));
+    }
+    Ok(())
+}
+
+/// Nobody but SYSTEM / Administrators / TrustedInstaller can replace `file`
+/// (if given) or anything in `dir`, or move `dir` or a folder above it away
+/// (Err names who could). The service runs `file` as SYSTEM.
+#[cfg(windows)]
+pub fn only_admins_can_change(dir: &Path, file: Option<&Path>) -> Result<(), String> {
+    let mut problems = vec![];
+    let mut look = |p: &Path, rights: u32, check_owner: bool| match read_acl(p) {
+        Ok((owner, dacl)) => {
+            for who in untrusted_writers(&owner, dacl.as_deref(), rights, check_owner) {
+                problems.push(format!("{}: {who}", p.display()));
+            }
+        }
+        Err(e) => problems.push(e),
+    };
+    if let Some(f) = file {
+        look(f, REPLACE_RIGHTS, true);
+    }
+    look(dir, REPLACE_RIGHTS, true);
+    let mut up = dir.parent();
+    while let Some(p) = up {
+        let root = p.parent().is_none();
+        look(p, MOVE_RIGHTS, !root);
+        up = p.parent();
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("ordinary accounts could change it - {}", problems.join("; ")))
+    }
+}
+
 // ------------------------------------------------------------ data folder
 
 /// Create the data folder and allow only the system and administrators to
@@ -297,10 +578,8 @@ pub fn protect_data_dir() -> Result<PathBuf, String> {
     {
         let d = dir.display().to_string();
         must("icacls", &[&d, "/setowner", "*S-1-5-32-544", "/T", "/C", "/Q"])?;
-        must(
-            "icacls",
-            &[&d, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)RX", "/Q"],
-        )?;
+        // the whole list replaced - another account's entry can't survive (V95-03)
+        lock_down(&dir)?;
         // children: inherit only (drops anything else a user may have added)
         must("icacls", &[&format!("{d}\\*"), "/reset", "/T", "/C", "/Q"]).or_else(|e| {
             if std::fs::read_dir(&dir).map(|mut r| r.next().is_none()).unwrap_or(false) {
@@ -309,6 +588,9 @@ pub fn protect_data_dir() -> Result<PathBuf, String> {
                 Err(e)
             }
         })?;
+        let settings = dir.join("guard.json");
+        only_admins_can_change(&dir, settings.is_file().then_some(settings.as_path()))
+            .map_err(|e| format!("PIA Lite's data folder isn't safe: {e}"))?;
     }
     #[cfg(not(windows))]
     {

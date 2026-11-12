@@ -2,6 +2,40 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.6] - 2026-11-12
+
+Fixes from the independent v0.9.5 review (V95-xx).
+
+### Fixed
+- **The DNS block / redirect is reported only when the firewall confirmed it** (V95-01, V95-11). A failed add,
+  remove or check leaves it "not known": `status` says "Other DNS : NOT blocked - <why>", it is tried again after
+  10 s, and stopping the guard removes it unless it is known to be off. The reason is shown when it is off (VPN
+  not connected / PIA's DNS not applied, proxy not listening, adapters unreadable).
+- **Linux: a guard that didn't stop stops teardown** (V95-02): `systemctl stop` failing, or the service still
+  running after 30 s, is an error before any firewall rule is touched; `disable` failures are no longer ignored.
+- **Teardown checks the Linux DNS redirect is gone** before removing anything else (V95-17); a failed boot-unit
+  `disable` is reported instead of ignored (V95-12).
+- **Windows folder permissions are set and checked as a whole** (V95-03): the data folder and a custom MSI folder
+  get their entire access list replaced (Administrators owner; SYSTEM + Administrators full, Users read; nothing
+  else kept - `icacls /grant:r` kept other accounts' entries), and setup refuses to register the SYSTEM service if
+  any other account could replace the program, change its folder or move a folder above it away - Program Files
+  included (checked, not assumed).
+- **setup fails when the guard doesn't answer or can't put the chosen block in place** (V95-06) - before, that
+  was a warning in the installer log. A .deb/.rpm upgrade whose setup fails now fails too (V95-09).
+- **`selftest-firewall` refuses to run on a PC where PIA Lite is set up** (Windows; it replaces the real rules) -
+  `--force` overrides (V95-04).
+- **install.sh --uninstall with the program missing** no longer says "removed" while rules, the saved boot rules
+  or the units are still active: it lists them, explains how to remove them and stops (V95-05).
+- Programs run by setup/teardown have a 2-minute limit (10 for package installs) and capped output; each update
+  download connection only gets what is left of its 120 s (V95-10).
+
+### Changed
+- **Releases are published only from a fully passing CI run** (V95-13): the release workflow runs the whole CI
+  workflow (format, clippy, tests, real WFP/nftables self-tests, a real MSI and .deb install/uninstall) and
+  publishes exactly the packages that CI built and installed, after checking the file list. Only the publish job
+  can write to the repository; actions are pinned to commit SHAs; unsigned releases say so in their notes
+  (V95-14, V95-15, V95-16).
+
 ## [0.9.5] - 2026-11-12
 
 ### Added

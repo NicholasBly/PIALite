@@ -274,29 +274,32 @@ fn check_program_location(exe: &Path, kind: &str) -> Result<(), String> {
             .map(|p| p.trim_end_matches('\\').to_lowercase() + "\\")
             .collect();
         let d = dir.display().to_string().to_lowercase() + "\\";
+        let safe = || {
+            sys::only_admins_can_change(dir, Some(exe))
+                .map_err(|e| format!("the guard service runs {} as SYSTEM, but {e} - not setting it up", exe.display()))
+        };
         if pf.iter().any(|p| d.starts_with(p)) {
-            return Ok(());
+            // Program Files is protected by Windows - checked, not assumed (V95-03)
+            return safe();
         }
         if kind == "msi" {
-            // a custom MSI folder: give it Program Files' protection
+            // a custom MSI folder: the whole access list replaced, everything
+            // inside inheriting it and owned by Administrators, then checked -
+            // folders above it are never changed, only checked
             let ds = dir.display().to_string();
-            sys::run(
-                "icacls",
-                &[
-                    &ds,
-                    "/inheritance:r",
-                    "/grant:r",
-                    "*S-1-5-18:(OI)(CI)F",
-                    "*S-1-5-32-544:(OI)(CI)F",
-                    "*S-1-5-32-545:(OI)(CI)RX",
-                    "/T",
-                    "/C",
-                    "/Q",
-                ],
-            )
-            .and_then(|(ok, out)| if ok { Ok(()) } else { Err(out.trim().to_string()) })
-            .map_err(|e| format!("could not protect {ds}: {e}"))?;
-            return Ok(());
+            let inside = format!("{ds}\\*");
+            sys::lock_down(dir)?;
+            for args in [
+                [ds.as_str(), "/setowner", "*S-1-5-32-544", "/T", "/C", "/Q"].as_slice(),
+                [inside.as_str(), "/reset", "/T", "/C", "/Q"].as_slice(),
+            ] {
+                sys::run("icacls", args)
+                    .and_then(|(ok, out)| if ok { Ok(()) } else { Err(out.trim().to_string()) })
+                    .map_err(|e| format!("could not protect {ds}: {e}"))?;
+            }
+            return safe().map_err(|e| {
+                format!("{e}. Install PIA Lite under Program Files, or in a folder whose parent folders only administrators can change")
+            });
         }
         Err(format!(
             "the guard service must run from Program Files, not {} (ordinary users could swap the program there) - install with the MSI to get the guard",
@@ -476,22 +479,18 @@ pub fn setup(mut o: Options) -> Result<(), String> {
         sys::stop_service()?; // a running guard re-reads everything when it starts
         sys::register_service(&guard_exe)?;
         sys::start_service()?;
-        match sys::wait_for_guard(Duration::from_secs(30)) {
-            Ok(st) => {
-                rep.ok(format!("guard service running (version {})", st.version));
-                if st.mode != BlockMode::Off && !st.armed {
-                    rep.warn(format!(
-                        "the internet block is NOT in place yet: {}",
-                        if st.fw_error.is_empty() { "see the guard log" } else { &st.fw_error }
-                    ));
-                }
-            }
-            Err(e) => rep.warn(e),
-        }
+        // a guard that doesn't answer, or whose chosen block isn't in place, is
+        // a failed setup - not a warning nobody sees in an installer log (V95-06)
+        let st = wait_until_armed(Duration::from_secs(30))?;
+        rep.ok(format!(
+            "guard service running (version {}){}",
+            st.version,
+            if st.mode == BlockMode::Off { "" } else { ", internet block in place" }
+        ));
     } else if sys::service_installed() {
         sys::remove_service()?;
         firewall::uninstall()?;
-        let _ = firewall::dns_capture(false);
+        firewall::dns_capture(false).map_err(|e| format!("could not remove the DNS redirect: {e}"))?;
         rep.ok("guard service removed (not chosen)");
     }
 
@@ -547,6 +546,35 @@ pub fn setup(mut o: Options) -> Result<(), String> {
         println!("Done, with {} warning(s) above (details in the guard log).", rep.warnings.len());
     }
     Ok(())
+}
+
+/// The guard answers and, unless its block mode is Off, has its block in place.
+fn wait_until_armed(limit: Duration) -> Result<pialite_common::status::GuardStatus, String> {
+    let until = std::time::Instant::now() + limit;
+    loop {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        let st = sys::wait_for_guard(left.max(Duration::from_secs(1)))
+            .map_err(|e| format!("{e} - PIA Lite is NOT set up (see the guard log)"))?;
+        if let Some(why) = unarmed(&st) {
+            if std::time::Instant::now() >= until {
+                return Err(format!("{why} - PIA Lite is NOT set up"));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        return Ok(st);
+    }
+}
+
+/// Why the guard's chosen protection isn't in place (None = it is).
+fn unarmed(st: &pialite_common::status::GuardStatus) -> Option<String> {
+    (st.mode != BlockMode::Off && !st.armed).then(|| {
+        format!(
+            "the guard could not put the internet block ({}) in place: {}",
+            st.mode.as_str(),
+            if st.fw_error.is_empty() { "see the guard log" } else { &st.fw_error }
+        )
+    })
 }
 
 fn pia_present() -> bool {
@@ -853,12 +881,20 @@ pub fn teardown(keep_config: bool) -> Result<(), String> {
     }
     // 2. the block, checked
     firewall::uninstall()?;
-    let _ = firewall::reset_open();
-    let _ = firewall::dns_capture(false);
+    firewall::reset_open().map_err(|e| format!("could not remove the temporary allow-all ({e}) - not continuing"))?;
     match firewall::installed() {
         Ok(false) => rep.ok("internet block rules removed (checked)"),
         Ok(true) => return Err("block rules are STILL in place - run `pialite-guard unlock` as admin, then teardown again".into()),
         Err(e) => return Err(format!("could not check the block rules were removed ({e}) - not continuing")),
+    }
+    // the DNS redirect (Linux) must not outlive the proxy it points at (review V95-17)
+    firewall::dns_capture(false).map_err(|e| {
+        format!("could not remove the DNS redirect ({e}) - not continuing; run `pialite-guard unlock` as admin, then teardown again")
+    })?;
+    match firewall::dns_capture_active() {
+        Ok(false) => {}
+        Ok(true) => return Err("the DNS redirect is STILL in place - run `pialite-guard unlock` as admin, then teardown again".into()),
+        Err(e) => return Err(format!("could not check the DNS redirect was removed ({e}) - not continuing")),
     }
     // 3. PIA as it was: DNS, kill switch (an unfinished hotel login), NextDNS app, startup task
     restore_pia_dns(&mut rep);
@@ -1000,6 +1036,86 @@ mod tests {
         assert!(sys::port53_blocks("127.0.0.1|YogaDNS", true));
         assert_eq!(sys::port53_text("0.0.0.0|svchost"), "svchost on 0.0.0.0:53");
         assert_eq!(sys::port53_text("0.0.0.0:53|dnsmasq"), "dnsmasq on 0.0.0.0:53");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commands_have_a_time_limit_and_an_output_cap() {
+        // review V95-10
+        use std::time::{Duration, Instant};
+        let t = Instant::now();
+        let e = sys::run_within("sleep", &["5"], Duration::from_millis(300)).unwrap_err();
+        assert!(e.contains("did not finish") && t.elapsed() < Duration::from_secs(3), "{e}");
+        let (ok, out) =
+            sys::run_within("sh", &["-c", "head -c 3000000 /dev/zero | tr '\\0' x; echo err >&2"], Duration::from_secs(20)).unwrap();
+        assert!(ok);
+        assert!(out.len() <= 256 * 1024 + 16 && out.ends_with("err\n"), "{} bytes", out.len());
+        let (ok, _) = sys::run_within("sh", &["-c", "exit 3"], Duration::from_secs(5)).unwrap();
+        assert!(!ok);
+    }
+
+    #[test]
+    fn who_else_can_change_the_program() {
+        // review V95-03: judged from the whole access list, not assumed
+        use sys::{untrusted_writers as w, Ace, MOVE_RIGHTS, REPLACE_RIGHTS};
+        let ace = |sid: &str, mask: u32, io: bool| Ace { allow: true, inherit_only: io, mask, sid: sid.into() };
+        let ti = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+        // Program Files as Windows ships it: nobody else
+        let pf = [
+            ace(ti, 0x1f01ff, false),
+            ace("S-1-5-18", 0x1301bf, false),
+            ace("S-1-5-32-544", 0x1301bf, false),
+            ace("S-1-5-32-545", 0x1200a9, false),
+            ace("S-1-3-0", 0x1000_0000, true), // CREATOR OWNER, inherit-only
+            ace("S-1-15-2-1", 0x1200a9, false),
+        ];
+        assert!(w(ti, Some(&pf), REPLACE_RIGHTS, true).is_empty());
+        // an extra Modify entry for Everyone, or a user's own folder
+        let mut bad = pf.to_vec();
+        bad.push(ace("S-1-1-0", 0x1301bf, false));
+        assert_eq!(w("S-1-5-32-544", Some(&bad), REPLACE_RIGHTS, true).len(), 1);
+        assert!(w("S-1-5-21-1-2-3-1001", Some(&pf), REPLACE_RIGHTS, true)[0].contains("owner"));
+        assert!(w("S-1-5-21-1-2-3-1001", Some(&pf), MOVE_RIGHTS, false).is_empty(), "drive root: owner not checked");
+        assert!(w("S-1-5-18", None, REPLACE_RIGHTS, true)[0].contains("everyone"), "no access list = everyone");
+        // C:\ : Authenticated Users may add folders (AD) - that doesn't move anything
+        let root = [ace("S-1-5-11", 0x4, false), ace("S-1-5-11", 0x1301bf, true), ace("S-1-5-32-545", 0x1200a9, false)];
+        assert!(w(ti, Some(&root), MOVE_RIGHTS, false).is_empty());
+        // ProgramData: Users may create files/folders in it, not rename what is there
+        let pd = [ace("S-1-5-32-545", 0x116, false)];
+        assert!(w("S-1-5-18", Some(&pd), MOVE_RIGHTS, true).is_empty());
+        assert_eq!(w("S-1-5-18", Some(&pd), REPLACE_RIGHTS, true).len(), 1, "but inside PIA Lite's own folder that's too much");
+        // a parent folder Authenticated Users can modify (delete = rename it)
+        assert_eq!(w("S-1-5-32-544", Some(&[ace("S-1-5-11", 0x1301bf, false)]), MOVE_RIGHTS, true).len(), 1);
+    }
+
+    #[test]
+    fn a_block_that_is_not_in_place_fails_setup() {
+        // review V95-06
+        use pialite_common::status::GuardStatus;
+        let st = |mode, armed, err: &str| GuardStatus { mode, armed, fw_error: err.into(), ..Default::default() };
+        assert!(unarmed(&st(BlockMode::Off, false, "")).is_none(), "Off: nothing to arm");
+        assert!(unarmed(&st(BlockMode::Startup, true, "")).is_none());
+        let why = unarmed(&st(BlockMode::Always, false, "Adding rule 'x' failed")).unwrap();
+        assert!(why.contains("always") && why.contains("Adding rule"), "{why}");
+        assert!(unarmed(&st(BlockMode::Startup, false, "")).unwrap().contains("guard log"));
+    }
+
+    #[test]
+    fn a_service_that_did_not_stop_is_an_error() {
+        // review V95-02: `systemctl stop` failing, or the guard still running,
+        // must stop teardown before it touches the firewall
+        use std::time::Duration;
+        let short = Duration::from_millis(300);
+        assert!(sys::stopped_or_why(true, "", || false, short).is_ok());
+        let e = sys::stopped_or_why(false, "Job for pialite-guard.service canceled.", || false, short).unwrap_err();
+        assert!(e.contains("could not stop") && e.contains("canceled"), "{e}");
+        assert!(sys::stopped_or_why(true, "", || true, short).unwrap_err().contains("still running"));
+        let n = std::cell::Cell::new(0);
+        let stops_soon = || {
+            n.set(n.get() + 1);
+            n.get() < 3
+        };
+        assert!(sys::stopped_or_why(true, "", stops_soon, Duration::from_secs(5)).is_ok(), "waits for it");
     }
 
     #[test]
