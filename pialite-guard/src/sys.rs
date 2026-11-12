@@ -620,7 +620,11 @@ pub fn dns_conflicts(d: &DnsSetup) -> Vec<String> {
     let re = DNS_APP_PATTERN.split('|').collect::<Vec<_>>();
     for p in &d.port53 {
         let prog = p.rsplit('|').next().unwrap_or("").to_lowercase();
-        if !prog.contains("pialite") && !prog.is_empty() && prog != "systemd-resolve" && prog != "systemd-resolved" {
+        // only an address that overlaps the proxy's 127.0.0.1:53 blocks it (Docker's
+        // DNS on its own network address, or resolved's 127.0.0.53, don't)
+        let addr = p.split('|').next().unwrap_or("").trim_end_matches(":53").trim_start_matches('[').trim_end_matches(']');
+        let clashes = matches!(addr, "127.0.0.1" | "0.0.0.0" | "::" | "*" | "");
+        if clashes && !prog.contains("pialite") && !prog.is_empty() && prog != "systemd-resolve" && prog != "systemd-resolved" {
             w.push(format!("another program holds DNS port 53 ({p}) - the guard's DNS proxy can't start while it does"));
         }
     }

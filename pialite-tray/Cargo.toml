@@ -1,6 +1,6 @@
 [package]
 name = "pialite-tray"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 description = "Lightweight tray app for Private Internet Access (talks to PIA through its official piactl tool)"
 license = "GPL-3.0-or-later"

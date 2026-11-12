@@ -985,6 +985,12 @@ mod tests {
         let empty = r#"{"adapters":[],"port53":[],"dns_apps":[],"resolved_dot":true}"#;
         assert!(sys::dns_conflicts(&sys::parse_dns_setup(empty).unwrap())[0].contains("systemd-resolved"));
         assert!(sys::parse_dns_setup("nope").is_err());
+        // seen on a CI machine: Docker's DNS on its own address doesn't block the proxy
+        let docker =
+            r#"{"adapters":[],"port53":["172.31.176.1|dockerd","127.0.0.53%lo:53|systemd-resolve"],"dns_apps":[],"resolved_dot":false}"#;
+        assert!(sys::dns_conflicts(&sys::parse_dns_setup(docker).unwrap()).is_empty());
+        let linux = r#"{"adapters":[],"port53":["0.0.0.0:53|dnsmasq"],"dns_apps":[],"resolved_dot":false}"#;
+        assert_eq!(sys::dns_conflicts(&sys::parse_dns_setup(linux).unwrap()).len(), 1);
     }
 
     #[test]

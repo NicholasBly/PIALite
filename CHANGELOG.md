@@ -2,6 +2,13 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.2] - 2026-11-11
+
+### Fixed
+- The DNS conflict check no longer reports a program that holds port 53 only on another address (e.g.
+  Docker's DNS on its own network) - only one that blocks the proxy's 127.0.0.1:53 counts. Found by CI on a
+  real Windows machine.
+
 ## [0.9.1] - 2026-11-11
 
 ### Added
