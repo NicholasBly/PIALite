@@ -621,14 +621,14 @@ pub fn dns_conflicts(d: &DnsSetup) -> Vec<String> {
         ));
     }
     let re = DNS_APP_PATTERN.split('|').collect::<Vec<_>>();
-    for p in &d.port53 {
-        let prog = p.rsplit('|').next().unwrap_or("").to_lowercase();
-        // only an address that overlaps the proxy's 127.0.0.1:53 blocks it (Docker's
-        // DNS on its own network address, or resolved's 127.0.0.53, don't)
-        let addr = p.split('|').next().unwrap_or("").trim_end_matches(":53").trim_start_matches('[').trim_end_matches(']');
-        let clashes = matches!(addr, "127.0.0.1" | "0.0.0.0" | "::" | "*" | "");
-        if clashes && !prog.contains("pialite") && !prog.is_empty() && prog != "systemd-resolve" && prog != "systemd-resolved" {
-            w.push(format!("another program holds DNS port 53 ({p}) - the guard's DNS proxy can't start while it does"));
+    // the guard already listening: whatever else is on port 53 didn't stop it
+    let guard_up = d.port53.iter().any(|p| p.rsplit('|').next().unwrap_or("").to_lowercase().contains("pialite"));
+    for p in d.port53.iter().filter(|_| !guard_up) {
+        if port53_blocks(p, cfg!(windows)) {
+            w.push(format!(
+                "another program holds DNS port 53 ({}) - the guard's DNS proxy can't start while it does",
+                port53_text(p)
+            ));
         }
     }
     for app in &d.dns_apps {
@@ -651,6 +651,30 @@ pub fn dns_conflicts(d: &DnsSetup) -> Vec<String> {
         w.push("systemd-resolved sends DNS over TLS itself - those lookups bypass PIA Lite (set DNSOverTLS=no)".into());
     }
     w
+}
+
+/// Does this port-53 holder ("ADDRESS|PROGRAM") keep the proxy off 127.0.0.1:53?
+/// Only an overlapping address does (Docker's DNS on its own network address, or
+/// resolved's 127.0.0.53, don't). On Windows a program on the wildcard address
+/// (0.0.0.0 - e.g. Internet Connection Sharing for Hyper-V, inside svchost) doesn't
+/// either: Windows lets 127.0.0.1:53 be taken next to it (seen on a real PC).
+pub fn port53_blocks(entry: &str, windows: bool) -> bool {
+    let mut f = entry.split('|');
+    let addr = f.next().unwrap_or("").trim_end_matches(":53").trim_start_matches('[').trim_end_matches(']');
+    let prog = f.next_back().unwrap_or("").to_lowercase();
+    let clashes = match addr {
+        "127.0.0.1" | "" => true,
+        "0.0.0.0" | "::" | "*" => !windows,
+        _ => false,
+    };
+    clashes && !prog.is_empty() && !prog.contains("pialite") && prog != "systemd-resolve" && prog != "systemd-resolved"
+}
+
+/// "0.0.0.0|svchost" -> "svchost on 0.0.0.0:53"
+pub fn port53_text(entry: &str) -> String {
+    let (addr, prog) = entry.rsplit_once('|').unwrap_or((entry, "?"));
+    let addr = addr.trim_end_matches(":53");
+    format!("{prog} on {addr}:53")
 }
 
 /// Windows: set hand-typed adapter DNS back to automatic; the old values are

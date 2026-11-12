@@ -682,7 +682,8 @@ pub fn adapter_dns(json: bool, reset: bool) -> Result<(), String> {
             );
         }
     }
-    println!("DNS port 53 held by: {}", if d.port53.is_empty() { "nothing".into() } else { d.port53.join(", ") });
+    let held: Vec<String> = d.port53.iter().map(|p| sys::port53_text(p)).collect();
+    println!("DNS port 53 held by: {}", if held.is_empty() { "nothing".into() } else { held.join(", ") });
     if !d.dns_apps.is_empty() {
         println!("DNS programs: {}", d.dns_apps.join(", "));
     }
@@ -990,7 +991,15 @@ mod tests {
             r#"{"adapters":[],"port53":["172.31.176.1|dockerd","127.0.0.53%lo:53|systemd-resolve"],"dns_apps":[],"resolved_dot":false}"#;
         assert!(sys::dns_conflicts(&sys::parse_dns_setup(docker).unwrap()).is_empty());
         let linux = r#"{"adapters":[],"port53":["0.0.0.0:53|dnsmasq"],"dns_apps":[],"resolved_dot":false}"#;
-        assert_eq!(sys::dns_conflicts(&sys::parse_dns_setup(linux).unwrap()).len(), 1);
+        assert_eq!(sys::dns_conflicts(&sys::parse_dns_setup(linux).unwrap()).len(), if cfg!(windows) { 0 } else { 1 });
+        // seen on a real Windows PC: ICS (svchost) on 0.0.0.0:53 next to the running guard
+        let ics = r#"{"adapters":[],"port53":["0.0.0.0|svchost","127.0.0.1|pialite-guard"],"dns_apps":[],"resolved_dot":false}"#;
+        assert!(sys::dns_conflicts(&sys::parse_dns_setup(ics).unwrap()).is_empty(), "the guard is up - nothing blocks it");
+        assert!(!sys::port53_blocks("0.0.0.0|svchost", true), "Windows: a wildcard holder doesn't block 127.0.0.1:53");
+        assert!(sys::port53_blocks("0.0.0.0:53|dnsmasq", false), "Linux: it does");
+        assert!(sys::port53_blocks("127.0.0.1|YogaDNS", true));
+        assert_eq!(sys::port53_text("0.0.0.0|svchost"), "svchost on 0.0.0.0:53");
+        assert_eq!(sys::port53_text("0.0.0.0:53|dnsmasq"), "dnsmasq on 0.0.0.0:53");
     }
 
     #[test]

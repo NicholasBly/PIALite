@@ -2,6 +2,16 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.4] - 2026-11-12
+
+### Added
+- The installer's last page has a ticked "Start PIA Lite now" box, so the tray starts right after installing.
+
+### Fixed
+- `adapter-dns` / setup no longer warn that port 53 is taken when the guard is already listening on it, or on
+  Windows when only a program on the wildcard address holds it (Internet Connection Sharing for Hyper-V, inside
+  svchost) - that doesn't stop the guard. Seen on a real PC. Port-53 holders are shown as "program on address".
+
 ## [0.9.3] - 2026-11-12
 
 ### Fixed
