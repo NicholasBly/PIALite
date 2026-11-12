@@ -40,10 +40,16 @@ jobs:
           cargo build --release
       - name: Firewall self-test (real nftables, in its own network namespace)
         run: sudo unshare --net ./target/release/pialite-guard selftest-firewall
-      - name: install.sh --uninstall never says "removed" unchecked (fake nft/systemctl)
-        run: sudo sh tests/install-sh-uninstall.sh
-      - name: install.sh --upgrade puts the previous version back if setup fails (fake tools)
-        run: sudo sh tests/install-sh-upgrade.sh
+      # the shell tests run in their own mount namespace (tests/isolate.sh): a
+      # stand-in "real install" here must be untouched afterwards (review R98-01)
+      - name: install.sh tests (uninstall checks, upgrade rollback) - isolated from real files
+        run: |
+          sudo mkdir -p /opt/pialite && echo real | sudo tee /opt/pialite/MARKER-real-install >/dev/null
+          sudo sh tests/install-sh-uninstall.sh
+          sudo sh tests/install-sh-upgrade.sh
+          test "$(cat /opt/pialite/MARKER-real-install)" = real || { echo "a test touched the real /opt/pialite"; exit 1; }
+          if grep -q pialite-test /proc/self/mounts; then echo "a test's mounts leaked out"; exit 1; fi
+          sudo rm -rf /opt/pialite
       - name: Packages (.deb, .rpm, .tar.gz)
         run: packaging/linux/build-packages.sh "$(grep -m1 '^version' pialite-guard/Cargo.toml | cut -d'"' -f2)"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -77,7 +83,12 @@ jobs:
         if: always() && steps.install.outcome != 'skipped'
         run: |
           rc=0
-          sudo apt-get remove -y pialite || rc=$?
+          # removed only if it got installed; the checks below run either way (R98-08)
+          if [ "$(dpkg-query -W -f='${Status}' pialite 2>/dev/null)" = "install ok installed" ]; then
+            sudo apt-get remove -y pialite || rc=$?
+          else
+            echo "the package never got installed - nothing to remove (see the install step's error)"
+          fi
           # "can't look" is a failure, not "nothing there"
           tables=$(sudo nft list tables) || { echo "nftables can't be inspected"; exit 1; }
           if printf '%s\n' "$tables" | grep -q pialite; then sudo nft list ruleset; echo "PIA Lite tables left behind"; exit 1; fi
@@ -178,9 +189,15 @@ jobs:
         if: always() && steps.install.outcome != 'skipped'
         shell: pwsh
         run: |
-          $msi = (Get-Item dist\*.msi).FullName
-          $p = Start-Process msiexec.exe -ArgumentList "/x `"$msi`" /qn /norestart /l*v `"$PWD\uninstall.log`"" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 150; throw "uninstall failed: $($p.ExitCode)" }
+          # uninstalled only if it got installed; the checks below run either way (R98-08)
+          $installed = (Get-Service PiaLiteGuard -ErrorAction SilentlyContinue) -or (Test-Path "$env:ProgramFiles\PiaLite")
+          if ($installed) {
+            $msi = (Get-Item dist\*.msi).FullName
+            $p = Start-Process msiexec.exe -ArgumentList "/x `"$msi`" /qn /norestart /l*v `"$PWD\uninstall.log`"" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 150; throw "uninstall failed: $($p.ExitCode)" }
+          } else {
+            "PIA Lite never got installed - nothing to uninstall (see the install step's error)"
+          }
           if (Get-Service PiaLiteGuard -ErrorAction SilentlyContinue) { throw "service left behind" }
           .\target\release\pialite-guard.exe check-rules
           if ($LASTEXITCODE -ne 0) { throw "block rules left behind" }

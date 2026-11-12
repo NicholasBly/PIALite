@@ -440,6 +440,8 @@ pub fn setup(mut o: Options) -> Result<(), String> {
     sys::protect_data_dir()?;
     let fresh = !config::data_dir().join("guard.json").is_file();
     let mut cfg = config::load(|| firewall::installed().unwrap_or(true)).config().clone();
+    // the settings as they were, to put back if removing the guard fails (R98-04)
+    let prior_cfg = cfg.clone();
     if o.interactive {
         interview(&mut o, &cfg, before.as_ref().map(|r| r.features.as_slice()));
     }
@@ -491,8 +493,11 @@ pub fn setup(mut o: Options) -> Result<(), String> {
         // the same protected order as teardown (review G97-01): stop the guard,
         // take its DNS redirect and block away (checked), and only then the
         // service - a failure before that brings the guard back, checked
-        let before = Expect::of(running_guard());
-        drop_guard(&mut rep, &sys::stop_service, &|| recover_guard(&before), &sys::remove_service)?;
+        // (the new settings are already saved: on a failure the previous ones
+        // go back first, so the guard comes back as it was - R98-04)
+        let before = Expect::of(running_guard(), prior_cfg.mode);
+        let recover = || restore_then_recover(&prior_cfg, &before, &recover_guard);
+        drop_guard(&mut rep, &sys::stop_service, &recover, &sys::remove_service)?;
         rep.ok("guard service removed (not chosen)");
     }
 
@@ -595,26 +600,36 @@ fn drop_guard(
 ) -> Result<(), String> {
     stop()?;
     remove_firewall_parts(rep, recover)?;
-    remove()
+    // the block and DNS redirect are gone (checked) - what is left is the
+    // service itself: tried twice, and a failure says exactly that (R98-05)
+    remove().or_else(|_| remove()).map_err(|e| {
+        format!(
+            "the guard's DNS redirect and block were removed (checked), but removing its service failed: {e}. \
+             The guard is stopped and protects nothing now; run setup again to finish (it is safe to repeat)"
+        )
+    })
 }
 
 /// What the running guard must show: `version` / `mode` when known (None =
 /// any), its block in place unless the mode is Off, and the DNS block /
-/// redirect on when `dns_on`.
+/// redirect on when `dns_on`. `seen` = taken from what the guard itself
+/// showed; otherwise only the saved settings were there to go by.
 #[derive(Clone, Debug, Default)]
 struct Expect {
     version: Option<String>,
     mode: Option<BlockMode>,
     dns_on: bool,
+    seen: bool,
 }
 
 impl Expect {
-    /// "As it was": what the guard showed before (nothing known = it must
-    /// answer and have the block of whatever mode it reports in place).
-    fn of(before: Option<pialite_common::status::GuardStatus>) -> Expect {
+    /// "As it was": what the guard showed before - or, when that couldn't be
+    /// read, the saved block mode, and nothing is ever confirmed as "as
+    /// before" on that basis alone (review R98-03).
+    fn of(before: Option<pialite_common::status::GuardStatus>, saved_mode: BlockMode) -> Expect {
         match before {
-            None => Expect::default(),
-            Some(st) => Expect { version: Some(st.version), mode: Some(st.mode), dns_on: st.dns_only_guard == Some(true) },
+            None => Expect { mode: Some(saved_mode), ..Default::default() },
+            Some(st) => Expect { version: Some(st.version), mode: Some(st.mode), dns_on: st.dns_only_guard == Some(true), seen: true },
         }
     }
 }
@@ -629,7 +644,25 @@ fn running_guard() -> Option<pialite_common::status::GuardStatus> {
 fn recover_guard(want: &Expect) -> Result<String, String> {
     sys::start_service().map_err(|e| format!("it could not be started: {e}"))?;
     let st = wait_ready(&sys::wait_for_guard, want, Duration::from_secs(30))?;
-    Ok(describe_guard(&st))
+    judge_recovery(want, &st)
+}
+
+/// Removing the guard failed: the settings from before this setup go back
+/// FIRST, so the guard restarts as it was, not with the new (e.g. Off) mode.
+fn restore_then_recover(prior: &Config, before: &Expect, recover: &dyn Fn(&Expect) -> Result<String, String>) -> Result<String, String> {
+    config::save(prior).map_err(|e| format!("the previous settings could not be put back: {e}"))?;
+    recover(before)
+}
+
+/// The guard shows `want` (wait_ready said so): how much does that prove?
+fn judge_recovery(want: &Expect, st: &pialite_common::status::GuardStatus) -> Result<String, String> {
+    if want.seen {
+        return Ok(describe_guard(st));
+    }
+    if st.mode == BlockMode::Off {
+        return Err("it runs in block mode off, and what it protected before couldn't be read - not confirmed".into());
+    }
+    Ok(format!("{} - checked against the saved settings only (what it showed before couldn't be read)", describe_guard(st)))
 }
 
 fn describe_guard(st: &pialite_common::status::GuardStatus) -> String {
@@ -645,7 +678,7 @@ fn describe_guard(st: &pialite_common::status::GuardStatus) -> String {
 /// The guard answers - THIS version, with the block mode just saved - and,
 /// unless that mode is Off, has its block in place (review V95-06, F-01).
 fn wait_until_armed(want: BlockMode, limit: Duration) -> Result<pialite_common::status::GuardStatus, String> {
-    let want = Expect { version: Some(env!("CARGO_PKG_VERSION").to_string()), mode: Some(want), dns_on: false };
+    let want = Expect { version: Some(env!("CARGO_PKG_VERSION").to_string()), mode: Some(want), ..Default::default() };
     wait_ready(&sys::wait_for_guard, &want, limit)
 }
 
@@ -999,7 +1032,8 @@ pub fn teardown(keep_config: bool) -> Result<(), String> {
     // 1. the guard first, so it can't put rules back while they're removed;
     //    what it showed now is what "back as before" means if a step fails
     let was_running = sys::service_running();
-    let before = Expect::of(running_guard());
+    let saved_mode = config::load(|| firewall::installed().unwrap_or(true)).config().mode;
+    let before = Expect::of(running_guard(), saved_mode);
     sys::stop_service()?;
     if was_running {
         rep.ok("guard service stopped");
@@ -1264,7 +1298,7 @@ mod tests {
         use pialite_common::status::GuardStatus;
         let v = "9.9.9";
         let st = |mode, armed, err: &str| GuardStatus { version: v.into(), mode, armed, fw_error: err.into(), ..Default::default() };
-        let want = |mode| Expect { version: Some(v.into()), mode: Some(mode), dns_on: false };
+        let want = |mode| Expect { version: Some(v.into()), mode: Some(mode), ..Default::default() };
         assert!(not_ready(&st(BlockMode::Off, false, ""), &want(BlockMode::Off)).is_none(), "Off asked, Off running");
         assert!(not_ready(&st(BlockMode::Startup, true, ""), &want(BlockMode::Startup)).is_none());
         let why = not_ready(&st(BlockMode::Always, false, "Adding rule 'x' failed"), &want(BlockMode::Always)).unwrap();
@@ -1287,7 +1321,7 @@ mod tests {
         let short = Duration::from_millis(600);
         let before =
             GuardStatus { version: "1.0".into(), mode: BlockMode::Always, armed: true, dns_only_guard: Some(true), ..Default::default() };
-        let want = Expect::of(Some(before.clone()));
+        let want = Expect::of(Some(before.clone()), BlockMode::Off);
         assert!(want.dns_on && want.mode == Some(BlockMode::Always));
         // answers as before: confirmed, and said what was seen
         let st = wait_ready(&|_| Ok(before.clone()), &want, short).unwrap();
@@ -1303,16 +1337,46 @@ mod tests {
         assert!(wait_ready(&|_| Ok(no_dns.clone()), &want, short).unwrap_err().contains("DNS block/redirect isn't on again"));
         let off = GuardStatus { mode: BlockMode::Off, ..before.clone() };
         assert!(wait_ready(&|_| Ok(off.clone()), &want, short).unwrap_err().contains("instead of always"));
-        // nothing known from before: it must answer, with its block in place
-        let anyhow = Expect::of(None);
-        assert!(wait_ready(&|_| Ok(unarmed.clone()), &anyhow, short).is_err());
-        assert!(wait_ready(&|_| Ok(off.clone()), &anyhow, short).is_ok());
+        // what it showed before couldn't be read (review R98-03): checked against
+        // the saved mode, and Off is never "restored protection"
+        let unknown = Expect::of(None, BlockMode::Always);
+        assert!(!unknown.seen);
+        assert!(wait_ready(&|_| Ok(unarmed.clone()), &unknown, short).is_err(), "not armed");
+        assert!(wait_ready(&|_| Ok(off.clone()), &unknown, short).unwrap_err().contains("instead of always"));
+        let st = wait_ready(&|_| Ok(before.clone()), &unknown, short).unwrap();
+        assert!(judge_recovery(&unknown, &st).unwrap().contains("saved settings only"));
+        let unknown_off = Expect::of(None, BlockMode::Off);
+        let st = wait_ready(&|_| Ok(off.clone()), &unknown_off, short).unwrap();
+        assert!(judge_recovery(&unknown_off, &st).unwrap_err().contains("not confirmed"));
+        assert!(judge_recovery(&want, &before).is_ok(), "seen before: confirmed");
         // and the message never says "back" without it
         let _g = config::tests::ENV_LOCK.lock().unwrap();
         let mut rep = Report { lines: vec![], warnings: vec![] };
         firewall::fail_next_uninstall();
         let e = remove_firewall_parts(&mut rep, &|| Err("didn't answer".into())).unwrap_err();
         assert!(e.contains("could NOT be confirmed (didn't answer)") && e.contains("unlock"), "{e}");
+    }
+
+    #[test]
+    fn a_failed_guard_removal_puts_the_previous_settings_back_first() {
+        // review R98-04: setup saved the new settings (Off, no DNS) before the
+        // guard was removed; the guard must restart with the OLD ones
+        let _g = config::tests::ENV_LOCK.lock().unwrap();
+        let d = config::tests::temp_data("prior");
+        let prior = Config { mode: BlockMode::Always, features: Some(config::Features { dns: true, hotel: true }), ..Default::default() };
+        let new = Config { mode: BlockMode::Off, features: Some(config::Features { dns: false, hotel: false }), ..Default::default() };
+        config::save(&new).unwrap();
+        let before = Expect::of(None, prior.mode);
+        let saw = std::cell::Cell::new(None);
+        let recover = |want: &Expect| {
+            let on_disk = config::load(|| true).config().clone();
+            saw.set(Some((on_disk.mode, on_disk.features().dns)));
+            assert_eq!(want.mode, Some(BlockMode::Always), "checked against the previous mode");
+            Ok("seen".to_string())
+        };
+        restore_then_recover(&prior, &before, &recover).unwrap();
+        assert_eq!(saw.get(), Some((BlockMode::Always, true)), "the guard came back with the previous settings");
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
@@ -1343,6 +1407,22 @@ mod tests {
         drop_guard(&mut rep, &stop, &recover, &remove).unwrap();
         assert_eq!(*order.borrow(), ["stop", "remove"]);
         assert_eq!(firewall::installed(), Ok(false));
+        // review R98-05: removing the service fails - tried again, then the
+        // message says what was removed and what is left
+        let tries = std::cell::Cell::new(0);
+        let flaky = || {
+            tries.set(tries.get() + 1);
+            if tries.get() == 1 {
+                Err("busy".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        drop_guard(&mut rep, &stop, &recover, &flaky).unwrap();
+        assert_eq!(tries.get(), 2, "one retry");
+        let broken = || Err("Access is denied".to_string());
+        let e = drop_guard(&mut rep, &stop, &recover, &broken).unwrap_err();
+        assert!(e.contains("were removed (checked)") && e.contains("Access is denied") && e.contains("protects nothing"), "{e}");
     }
 
     #[test]

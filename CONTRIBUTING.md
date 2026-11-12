@@ -23,6 +23,8 @@ cargo test --workspace
 sudo unshare --net target/debug/pialite-guard selftest-firewall   # Linux, real nftables in a throwaway namespace
 sudo sh tests/install-sh-uninstall.sh                             # Linux, install.sh's uninstall checks (fake tools)
 sudo sh tests/install-sh-upgrade.sh                               # Linux, install.sh's upgrade rollback (fake tools)
+# (both run in their own mount namespace, with /opt, /usr/local, /var/lib and the unit folders hidden -
+#  safe next to a real installation; they refuse to run if they can't isolate themselves)
 ```
 
 `selftest-firewall` replaces PIA Lite's real firewall rules: on Windows it refuses to run where PIA Lite is

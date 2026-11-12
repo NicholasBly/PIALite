@@ -501,3 +501,13 @@ What is protected, from what, and what is NOT claimed.
    setup succeeds, else restored and the old guard started. Releases: the
    publish job fails without the signing key, and the packaged guard's
    verify-release must accept the release and refuse a tampered package.
+   0.9.9 (review R98): install.sh tests run only in a private mount
+   namespace (tmpfs over /opt, /usr/local, /var/lib, unit dirs; isolated =
+   own mnt ns differs from the parent's). Tarball install: stage to
+   /opt/pialite.new and copy the version in use (bin, share, guard.json,
+   install.json, its status --json mode/armed) to /opt/pialite.rollback
+   before stopping the guard; after the stop one EXIT/INT/TERM trap rolls
+   everything back and confirms "as before" only from the guard's own
+   status. Recovery: unknown earlier state = checked against the saved mode,
+   Off never confirmed; removing the guard restores the previous settings
+   before restarting it; service removal retried once.

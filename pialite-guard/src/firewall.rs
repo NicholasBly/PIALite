@@ -469,7 +469,7 @@ mod stub {
         Ok(DNS_CAPTURE.load(std::sync::atomic::Ordering::SeqCst))
     }
     #[allow(dead_code)]
-    pub fn dns_block_fail_next_rebuild_for_test() {
+    pub fn dns_block_fail_next_rebuild_for_test(_stage: u8) {
         DNS_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     #[allow(dead_code)]
@@ -2069,8 +2069,9 @@ mod win {
     /// dropped (review G97-03).
     const DNS_SUBLAYERS: [GUID; 2] =
         [GUID::from_u128(0x5a1f7e2c_3b4d_4c8a_9e61_2f0b6d1c7a03), GUID::from_u128(0x5a1f7e2c_3b4d_4c8a_9e61_2f0b6d1c7a04)];
-    /// selftest-firewall only: make the next rebuild fail halfway.
-    static FAIL_NEXT_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// selftest-firewall only: make the next rebuild fail at a stage - 1 opening
+    /// the engine, 2 adding the sublayer, 3 adding a rule, 4 checking it.
+    static FAIL_NEXT_BUILD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
     /// One rule of the DNS block, as planned.
     #[derive(Clone)]
@@ -2219,6 +2220,10 @@ mod win {
     }
 
     fn build_dns_block(key: GUID) -> Result<DnsBlock, String> {
+        let fail = FAIL_NEXT_BUILD.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if fail == 1 {
+            return Err("injected: the firewall engine could not be opened (test)".into());
+        }
         let e = Engine::open(true)?;
         let plan = dns_plan();
         let sname = wide("PIA Lite: plain DNS only through the guard");
@@ -2229,16 +2234,22 @@ mod win {
                 weight: SUBLAYER_WEIGHT - 1,
                 ..Default::default()
             };
+            if fail == 2 {
+                return Err("injected: the DNS block's sublayer could not be added (test)".to_string());
+            }
             check("Adding the DNS block's sublayer", unsafe { FwpmSubLayerAdd0(e.0, &s, null_mut()) })?;
             let mut rules = vec![];
             for r in &plan {
                 rules.push((add_dns_filter(&e, &key, r)?, r.clone()));
-                if FAIL_NEXT_BUILD.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    return Err("injected: the DNS block could not be built (test)".to_string());
+                if fail == 3 {
+                    return Err("injected: a DNS block rule could not be added (test)".to_string());
                 }
             }
             Ok(rules)
         })?;
+        if fail == 4 {
+            return Err("injected: the new DNS block could not be checked (test)".into());
+        }
         let b = DnsBlock { e, key, rules };
         if let Some(why) = dns_block_differs(&b)? {
             return Err(format!("the DNS block isn't as planned right after adding it ({why})"));
@@ -2272,9 +2283,9 @@ mod win {
         }
     }
 
-    /// selftest-firewall only: the next rebuild of the DNS block fails halfway.
-    pub fn dns_block_fail_next_rebuild_for_test() {
-        FAIL_NEXT_BUILD.store(true, std::sync::atomic::Ordering::SeqCst);
+    /// selftest-firewall only: the next rebuild of the DNS block fails at `stage`.
+    pub fn dns_block_fail_next_rebuild_for_test(stage: u8) {
+        FAIL_NEXT_BUILD.store(stage, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn open_all() -> Result<OpenAll, String> {

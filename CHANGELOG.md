@@ -2,6 +2,32 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.9] - 2026-11-12
+
+Fixes from the independent v0.9.8 review (R98-01 .. R98-09).
+
+### Fixed
+- **The install.sh tests can't touch a real installation** (R98-01): they now run only in their own mount
+  namespace, with /opt, /usr/local, /var/lib and the systemd unit folders replaced by empty tmpfs, and refuse
+  to run otherwise (not root, no `unshare`, can't tell). Before, the upgrade test's cleanup could delete a real
+  /opt/pialite. CI places a stand-in "real install" next to them and checks it is untouched afterwards.
+- **Tarball upgrades are all-or-nothing** (R98-02, R98-06): the new version is staged and the version in use
+  (programs, settings, and the block mode its guard reports) is copied *before* the guard is stopped; a failure
+  at ANY later step - moving files, links, the menu entry, setup, Ctrl+C - puts the previous programs and
+  settings back, starts the previous guard, and says "as before" only when it reports the same block mode with
+  its block in place; otherwise "could NOT be confirmed", and the copy is kept. Tested with failures injected
+  at every step.
+- **Recovery never certifies protection it couldn't see** (R98-03): when the guard's earlier state can't be
+  read, it is checked against the saved block mode, says so, and a guard that comes back in Off mode is
+  "not confirmed".
+- **Turning the guard off puts the previous settings back first if that fails** (R98-04), so the guard comes
+  back as it was, not with the new mode; removing the service is retried once, and if it still fails the message
+  says exactly what was removed and what is left (R98-05).
+- **Windows DNS block rebuild: a failure at each stage** (opening the engine, adding the sublayer, adding a rule,
+  checking the new block) is injected in the firewall self-test, which checks that UDP/53, TCP/53 and TCP/853
+  from another program stay blocked by what is left of the old block (IPv4; hosted runners have no IPv6) (R98-07).
+- CI uninstalls only what got installed and inspects either way (R98-08).
+
 ## [0.9.8] - 2026-11-12
 
 Fixes from the independent v0.9.7 review (G97-01 .. G97-09). **The first signed release.**

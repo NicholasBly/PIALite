@@ -1,10 +1,12 @@
 #!/bin/sh
 # install.sh --uninstall with PIA Lite's program missing (review V95-05, F-08):
 # it may only say "removed" when it could CHECK that nothing is left.
-# Uses fake nft / systemctl; run as root on a machine WITHOUT PIA Lite installed
-# (it deletes /opt/pialite and /usr/local/bin/pialite-* if they exist).
+# Fake nft / systemctl; runs in its own mount namespace with /opt, /usr/local,
+# /var/lib and the unit folders hidden (tests/isolate.sh), so it can't touch a
+# real installation. Run as root: sudo sh tests/install-sh-uninstall.sh
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/isolate.sh"
 INSTALL="$HERE/../packaging/linux/install.sh"
 FAKE=$(mktemp -d)
 trap 'rm -rf "$FAKE"' EXIT

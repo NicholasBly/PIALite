@@ -1328,10 +1328,11 @@ fn selftest_allowed(service: bool, rules: Result<bool, String>, force: bool) -> 
 }
 
 /// Windows, with the temporary allow-all in place: before the DNS block a
-/// program (PowerShell) gets an answer from 9.9.9.9; with it - after it was
-/// damaged twice and repaired - its lookup and its DNS-over-TLS connection
-/// are refused while the guard's own connection to 9.9.9.9:853 gets
-/// through; after it, lookups work again.
+/// program (PowerShell) gets answers from 9.9.9.9 over UDP and TCP and can
+/// connect to its port 853; with the block - damaged, repaired, and rebuilt
+/// with a failure injected at each stage - all three are refused (IPv4)
+/// while the guard's own connection to 9.9.9.9:853 gets through; after it,
+/// lookups work again.
 #[cfg(windows)]
 fn windows_dns_block_test() -> Result<(), String> {
     use std::time::Duration;
@@ -1342,15 +1343,61 @@ fn windows_dns_block_test() -> Result<(), String> {
             .map(|s| s.success())
             .unwrap_or(false)
     };
-    // a different name each time, so no cached answer counts
-    let lookup = |name: &str| {
-        format!("try {{ if (Resolve-DnsName {name} -Server 9.9.9.9 -Type A -DnsOnly -QuickTimeout -ErrorAction Stop) {{ exit 0 }} }} catch {{}}; exit 1")
+    // a different name each time, so no cached answer counts; UDP or TCP
+    let lookup_via = |name: &str, tcp: bool| {
+        format!(
+            "try {{ if (Resolve-DnsName {name} -Server 9.9.9.9 -Type A -DnsOnly -QuickTimeout{} -ErrorAction Stop) {{ exit 0 }} }} catch {{}}; exit 1",
+            if tcp { " -TcpOnly" } else { "" }
+        )
     };
+    let lookup = |name: &str| lookup_via(name, false);
     const TLS: &str =
         "$c = New-Object Net.Sockets.TcpClient; try { if ($c.ConnectAsync('9.9.9.9', 853).Wait(3000)) { exit 0 } } catch {}; exit 1";
+    // positive controls: each kind of traffic works before the block
     if !ps(&lookup("example.com")) {
         return Err("no answer from 9.9.9.9 even before the DNS block (no network?)".into());
     }
+    if !ps(&lookup_via("iana.org", true)) {
+        return Err("no answer from 9.9.9.9 over TCP even before the DNS block".into());
+    }
+    if !ps(TLS) {
+        return Err("no connection to 9.9.9.9:853 even before the DNS block".into());
+    }
+    // what the DNS block must stop from another program (IPv4: hosted runners
+    // have no IPv6 - IPv6 is NOT tested here). Real names that resolve, a
+    // different one for every query, so no cached answer can count.
+    const NAMES: [&str; 12] = [
+        "ietf.org",
+        "icann.org",
+        "w3.org",
+        "kernel.org",
+        "debian.org",
+        "python.org",
+        "rust-lang.org",
+        "mozilla.org",
+        "wikipedia.org",
+        "gnu.org",
+        "apache.org",
+        "openssl.org",
+    ];
+    let next = std::cell::Cell::new(0usize);
+    let name = || {
+        let n = NAMES[next.get() % NAMES.len()];
+        next.set(next.get() + 1);
+        n
+    };
+    let all_stopped = |when: &str| -> Result<(), String> {
+        if ps(&lookup(name())) {
+            return Err(format!("{when}: a program's own UDP lookup at 9.9.9.9 was NOT blocked"));
+        }
+        if ps(&lookup_via(name(), true)) {
+            return Err(format!("{when}: a program's own TCP lookup at 9.9.9.9 was NOT blocked"));
+        }
+        if ps(TLS) {
+            return Err(format!("{when}: a program's DNS-over-TLS connection to 9.9.9.9 was NOT blocked"));
+        }
+        Ok(())
+    };
     firewall::dns_capture(true)?;
     let during = (|| -> Result<(), String> {
         if !firewall::dns_capture_active()? {
@@ -1369,29 +1416,27 @@ fn windows_dns_block_test() -> Result<(), String> {
                 return Err(format!("the DNS block wasn't repaired after {what}"));
             }
         }
-        // a repair that fails halfway keeps what is left of the old block
-        // (review G97-03): its IPv4 port-53 rule must still stop a lookup
-        firewall::dns_block_damage_for_test(0)?;
-        firewall::dns_block_fail_next_rebuild_for_test();
-        if firewall::dns_capture(true).is_ok() {
-            return Err("the injected rebuild failure didn't fail".into());
+        // a repair that fails - at each stage it can fail - keeps what is
+        // left of the old block (review G97-03, R98-07): with its IPv6 port-853
+        // rule deleted, it must still stop IPv4 UDP/53, TCP/53 and TCP/853
+        for (stage, what) in
+            [(1u8, "opening the firewall engine"), (2, "adding the sublayer"), (3, "adding a rule"), (4, "checking the new block")]
+        {
+            firewall::dns_block_damage_for_test(0)?;
+            firewall::dns_block_fail_next_rebuild_for_test(stage);
+            if firewall::dns_capture(true).is_ok() {
+                return Err(format!("the injected failure at {what} didn't fail the rebuild"));
+            }
+            if firewall::dns_capture_active()? {
+                return Err(format!("a damaged DNS block was reported as intact (failure at {what})"));
+            }
+            all_stopped(&format!("rebuild failed at {what}"))?;
+            firewall::dns_capture(true)?;
+            if !firewall::dns_capture_active()? {
+                return Err(format!("the DNS block wasn't repaired after the failure at {what}"));
+            }
         }
-        if firewall::dns_capture_active()? {
-            return Err("a damaged DNS block was reported as intact".into());
-        }
-        if ps(&lookup("iana.org")) {
-            return Err("after a failed rebuild, the old DNS block no longer stopped a lookup".into());
-        }
-        firewall::dns_capture(true)?;
-        if !firewall::dns_capture_active()? {
-            return Err("the DNS block wasn't repaired after the failed rebuild".into());
-        }
-        if ps(&lookup("example.net")) {
-            return Err("a program's own lookup at 9.9.9.9 was NOT blocked".into());
-        }
-        if ps(TLS) {
-            return Err("a program's DNS-over-TLS connection to 9.9.9.9 was NOT blocked".into());
-        }
+        all_stopped("repaired block")?;
         let addr: std::net::SocketAddr = "9.9.9.9:853".parse().map_err(|_| "address")?;
         std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
             .map_err(|e| format!("the guard's own connection to 9.9.9.9:853 was blocked: {e}"))?;
