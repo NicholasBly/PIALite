@@ -53,8 +53,19 @@ job / systemd path unit for it).
 
 ## 2. On the PC: point PIA Lite at it
 
-Copy Pi-hole's certificate authority to the PC: `/etc/pihole/tls_ca.crt` (it is public - no secrets in it). Then,
-in an administrator window (Windows) or with sudo (Linux):
+Copy Pi-hole's certificate authority to the PC: `/etc/pihole/tls_ca.crt` (it is public - no secrets in it, but
+only Pi-hole may read the file, so copy it to your home folder first):
+
+```sh
+# on the Pi
+sudo cp /etc/pihole/tls_ca.crt ~/ && sudo chown "$USER" ~/tls_ca.crt
+# on the PC (PowerShell or a terminal) - your Pi user and address
+scp you@192.168.1.2:~/tls_ca.crt .
+```
+
+Check from the PC that port 853 can be reached: `Test-NetConnection 192.168.1.2 -Port 853` (Windows) or
+`nc -zv 192.168.1.2 853` (Linux). If not, the Pi's firewall needs to let TCP 853 in. Then, in an administrator
+window (Windows) or with sudo (Linux):
 
 ```text
 pialite-guard set-dns custom tls://pi.hole 192.168.1.2 C:\Users\you\Downloads\tls_ca.crt
