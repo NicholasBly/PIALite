@@ -111,8 +111,21 @@ if ! command -v systemctl >/dev/null 2>&1; then
     exit 1
 fi
 
-# the old guard stops before its program is replaced
-systemctl stop pialite-guard.service >/dev/null 2>&1 || true
+# the old guard stops before its program is replaced - and if it won't
+# stop, nothing is replaced (review G97-05)
+if systemctl cat pialite-guard.service >/dev/null 2>&1; then
+    if ! systemctl stop pialite-guard.service; then
+        echo "The running PIA Lite guard could not be stopped - nothing was changed. Try again, or reboot first." >&2
+        exit 1
+    fi
+fi
+# the programs in use now are kept until the new ones are set up
+had_old=0
+if [ -x "$PREFIX/bin/pialite-guard" ]; then
+    rm -rf "$PREFIX/bin.previous"
+    cp -a "$PREFIX/bin" "$PREFIX/bin.previous"
+    had_old=1
+fi
 install -d -m 0755 "$PREFIX" "$PREFIX/bin" "$PREFIX/share" "$PREFIX/share/pialite"
 install -m 0755 "$HERE/bin/pialite-tray" "$HERE/bin/pialite-guard" "$PREFIX/bin/"
 printf 'tarball\n' > "$PREFIX/share/pialite/install-kind"
@@ -123,9 +136,26 @@ sed "s|^Exec=.*|Exec=$PREFIX/bin/pialite-tray|" "$HERE/share/pialite.desktop" > 
 install -m 0644 "$HERE/share/pialite.svg" /usr/local/share/icons/hicolor/scalable/apps/pialite.svg
 
 if [ "$1" = "--upgrade" ] && [ -f /var/lib/pialite/install.json ]; then
-    "$PREFIX/bin/pialite-guard" setup --kind tarball
+    set -- setup --kind tarball
 else
-    "$PREFIX/bin/pialite-guard" setup --kind tarball --interactive
+    set -- setup --kind tarball --interactive
 fi
+if ! "$PREFIX/bin/pialite-guard" "$@"; then
+    if [ "$had_old" = 1 ]; then
+        # put the previous programs back and start the previous guard again
+        rm -rf "$PREFIX/bin"
+        mv "$PREFIX/bin.previous" "$PREFIX/bin"
+        if systemctl start pialite-guard.service && systemctl is-active --quiet pialite-guard.service; then
+            echo "Setting up this version FAILED (see above). The previous version was put back and its guard is running again." >&2
+        else
+            echo "Setting up this version FAILED (see above), and the previous guard could not be started again." >&2
+            echo "If you are offline: sudo $PREFIX/bin/pialite-guard unlock" >&2
+        fi
+    else
+        echo "Setting up PIA Lite FAILED (see above). To remove what was installed: sudo ./install.sh --uninstall" >&2
+    fi
+    exit 1
+fi
+rm -rf "$PREFIX/bin.previous"
 echo
 echo "Start the tray from your applications menu ('PIA Lite') or run: pialite-tray"

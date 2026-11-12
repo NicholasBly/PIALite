@@ -56,6 +56,7 @@ Install and features:
   pialite-guard adapter-dns [--reset]    Windows: DNS set by hand on network adapters (it can bypass
                                          PIA Lite); --reset (admin) sets them back to automatic
   pialite-guard check-update [--json]    is there a newer release on GitHub?
+  pialite-guard verify-release DIR       check a release folder (SHA256SUMS signed with the built-in key, every file)
   pialite-guard apply-update             (admin) download, verify (signed) and install it
 Checks:
   pialite-guard test-dns [--json] [--canary DOMAIN]
@@ -108,6 +109,7 @@ fn main() -> ExitCode {
         ["adapter-dns", "--json"] => setup::adapter_dns(true, false),
         ["adapter-dns", "--reset"] => setup::adapter_dns(false, true),
         ["set-dns", rest @ ..] if !rest.is_empty() && rest.len() <= 4 => set_dns(rest),
+        ["verify-release", dir] => update::verify_release(std::path::Path::new(dir)),
         ["check-update"] => update::check(false),
         ["check-update", "--json"] => update::check(true),
         ["apply-update"] => update::apply(),
@@ -1366,6 +1368,23 @@ fn windows_dns_block_test() -> Result<(), String> {
             if !firewall::dns_capture_active()? {
                 return Err(format!("the DNS block wasn't repaired after {what}"));
             }
+        }
+        // a repair that fails halfway keeps what is left of the old block
+        // (review G97-03): its IPv4 port-53 rule must still stop a lookup
+        firewall::dns_block_damage_for_test(0)?;
+        firewall::dns_block_fail_next_rebuild_for_test();
+        if firewall::dns_capture(true).is_ok() {
+            return Err("the injected rebuild failure didn't fail".into());
+        }
+        if firewall::dns_capture_active()? {
+            return Err("a damaged DNS block was reported as intact".into());
+        }
+        if ps(&lookup("iana.org")) {
+            return Err("after a failed rebuild, the old DNS block no longer stopped a lookup".into());
+        }
+        firewall::dns_capture(true)?;
+        if !firewall::dns_capture_active()? {
+            return Err("the DNS block wasn't repaired after the failed rebuild".into());
         }
         if ps(&lookup("example.net")) {
             return Err("a program's own lookup at 9.9.9.9 was NOT blocked".into());

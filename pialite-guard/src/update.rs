@@ -174,13 +174,8 @@ pub fn one_click(kind: &str) -> bool {
     matches!(kind, "msi" | "deb" | "rpm" | "tarball")
 }
 
-pub fn sha256_hex(data: &[u8]) -> String {
-    ring::digest::digest(&ring::digest::SHA256, data).as_ref().iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// The package must be listed in SHA256SUMS with its exact hash, and
-/// SHA256SUMS must carry a valid signature from `key`.
-pub fn verify(key: &[u8; 32], sums: &[u8], sig: &[u8], name: &str, data: &[u8]) -> Result<(), String> {
+/// SHA256SUMS carries a valid ed25519 signature from `key` (raw 64 bytes or base64).
+fn check_signature(key: &[u8; 32], sums: &[u8], sig: &[u8]) -> Result<(), String> {
     let sig = if sig.len() == 64 {
         sig.to_vec()
     } else {
@@ -188,7 +183,17 @@ pub fn verify(key: &[u8; 32], sums: &[u8], sig: &[u8], name: &str, data: &[u8]) 
     };
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
         .verify(sums, &sig)
-        .map_err(|_| "the checksum list's signature is NOT valid - not installing".to_string())?;
+        .map_err(|_| "the checksum list's signature is NOT valid - not installing".to_string())
+}
+
+pub fn sha256_hex(data: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, data).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The package must be listed in SHA256SUMS with its exact hash, and
+/// SHA256SUMS must carry a valid signature from `key`.
+pub fn verify(key: &[u8; 32], sums: &[u8], sig: &[u8], name: &str, data: &[u8]) -> Result<(), String> {
+    check_signature(key, sums, sig)?;
     let text = std::str::from_utf8(sums).map_err(|_| "checksum list is not text")?;
     let want = text
         .lines()
@@ -201,6 +206,36 @@ pub fn verify(key: &[u8; 32], sums: &[u8], sig: &[u8], name: &str, data: &[u8]) 
         return Err(format!("{name} does not match its signed checksum - not installing"));
     }
     Ok(())
+}
+
+/// `verify-release DIR`: what the updater checks, for a whole release folder -
+/// SHA256SUMS signed with the key built into THIS program, and every file it
+/// lists matching its hash. The release job runs it with the packaged program
+/// before publishing (review G97-06).
+pub fn verify_release(dir: &std::path::Path) -> Result<(), String> {
+    let key = public_key().ok_or("no release signing key is built into this program")?;
+    let n = verify_folder(&key, dir)?;
+    println!("OK: SHA256SUMS is signed with the key built into this program, and all {n} files listed in it match");
+    Ok(())
+}
+
+fn verify_folder(key: &[u8; 32], dir: &std::path::Path) -> Result<usize, String> {
+    let read = |name: &str| std::fs::read(dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display()));
+    let sums = read("SHA256SUMS")?;
+    let sig = read("SHA256SUMS.sig")?;
+    check_signature(key, &sums, &sig)?; // the list first, before any file is read
+    let text = std::str::from_utf8(&sums).map_err(|_| "SHA256SUMS is not text")?.to_string();
+    let mut n = 0;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let (_, name) = line.split_once(char::is_whitespace).ok_or(format!("unreadable line in SHA256SUMS: {line}"))?;
+        let name = name.trim().trim_start_matches('*');
+        verify(key, &sums, &sig, name, &read(name)?)?;
+        n += 1;
+    }
+    if n == 0 {
+        return Err("SHA256SUMS lists no files".into());
+    }
+    Ok(n)
 }
 
 fn current_kind() -> String {
@@ -358,6 +393,32 @@ fn install(kind: &str, file: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_release_folder_is_checked_like_the_updater_does() {
+        use ring::signature::KeyPair;
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let key: [u8; 32] = kp.public_key().as_ref().try_into().unwrap();
+        let dir = std::env::temp_dir().join(format!("pialite-rel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.msi"), b"msi").unwrap();
+        std::fs::write(dir.join("b.deb"), b"deb").unwrap();
+        let sums = format!("{}  a.msi\n{}  b.deb\n", super::sha256_hex(b"msi"), super::sha256_hex(b"deb"));
+        std::fs::write(dir.join("SHA256SUMS"), &sums).unwrap();
+        std::fs::write(dir.join("SHA256SUMS.sig"), kp.sign(sums.as_bytes()).as_ref()).unwrap();
+        assert_eq!(super::verify_folder(&key, &dir), Ok(2));
+        // a changed package, a changed list, another key: refused
+        std::fs::write(dir.join("b.deb"), b"DEB").unwrap();
+        assert!(super::verify_folder(&key, &dir).unwrap_err().contains("b.deb does not match"));
+        std::fs::write(dir.join("b.deb"), b"deb").unwrap();
+        std::fs::write(dir.join("SHA256SUMS"), sums.replace("a.msi", "c.msi")).unwrap();
+        assert!(super::verify_folder(&key, &dir).unwrap_err().contains("NOT valid"));
+        std::fs::write(dir.join("SHA256SUMS"), &sums).unwrap();
+        assert!(super::verify_folder(&[7u8; 32], &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

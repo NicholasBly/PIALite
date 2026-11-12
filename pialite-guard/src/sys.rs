@@ -54,8 +54,18 @@ pub fn run_within(prog: &str, args: &[&str], limit: Duration) -> Result<(bool, S
         c.process_group(0);
     }
     let mut child = c.spawn().map_err(|e| format!("{prog}: {e}"))?;
+    // Windows: if the job object can't be had, say so - on a timeout then
+    // only the program itself can be stopped (review G97-04)
     #[cfg(windows)]
-    let job = Job::for_child(&child);
+    let (job, job_note) = match Job::for_child(&child) {
+        Ok(j) => (Some(j), String::new()),
+        Err(e) => {
+            crate::config::log(&format!("{prog}: {e} - on a timeout only {prog} itself can be stopped"));
+            (None, format!(" (programs it started may still be running: {e})"))
+        }
+    };
+    #[cfg(not(windows))]
+    let job_note = String::new();
     let kill_all = |child: &mut std::process::Child| {
         #[cfg(unix)]
         unsafe {
@@ -93,7 +103,7 @@ pub fn run_within(prog: &str, args: &[&str], limit: Duration) -> Result<(bool, S
             Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
                 kill_all(&mut child);
-                return Err(format!("{prog} did not finish within {} s and was stopped", limit.as_secs()));
+                return Err(format!("{prog} did not finish within {} s and was stopped{job_note}", limit.as_secs()));
             }
             Err(e) => return Err(format!("{prog}: {e}")),
         }
@@ -106,7 +116,7 @@ pub fn run_within(prog: &str, args: &[&str], limit: Duration) -> Result<(bool, S
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 kill_all(&mut child);
                 return Err(format!(
-                    "{prog} finished, but a program it started still held its output after {} s - stopped",
+                    "{prog} finished, but a program it started still held its output after {} s - stopped{job_note}",
                     limit.as_secs()
                 ));
             }
@@ -127,15 +137,18 @@ struct Job(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
 impl Job {
-    fn for_child(child: &std::process::Child) -> Option<Job> {
+    fn for_child(child: &std::process::Child) -> Result<Job, String> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
         let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if h.is_null() {
-            return None;
+            return Err(format!("could not create a job object ({})", std::io::Error::last_os_error()));
         }
-        let job = Job(h);
-        (unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as _) } != 0).then_some(job)
+        let job = Job(h); // closed on every path from here
+        if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as _) } == 0 {
+            return Err(format!("could not put it in a job object ({})", std::io::Error::last_os_error()));
+        }
+        Ok(job)
     }
     fn kill(&self) {
         unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1) };

@@ -481,16 +481,18 @@ pub fn setup(mut o: Options) -> Result<(), String> {
         sys::start_service()?;
         // a guard that doesn't answer, or whose chosen block isn't in place, is
         // a failed setup - not a warning nobody sees in an installer log (V95-06)
-        let st = wait_until_armed(cfg.mode, Duration::from_secs(30))?;
+        let st = wait_until_armed(cfg.mode, Duration::from_secs(30)).map_err(|e| format!("{e} - PIA Lite is NOT set up"))?;
         rep.ok(format!(
             "guard service running (version {}){}",
             st.version,
             if st.mode == BlockMode::Off { "" } else { ", internet block in place" }
         ));
     } else if sys::service_installed() {
-        sys::remove_service()?;
-        firewall::uninstall()?;
-        firewall::dns_capture(false).map_err(|e| format!("could not remove the DNS redirect: {e}"))?;
+        // the same protected order as teardown (review G97-01): stop the guard,
+        // take its DNS redirect and block away (checked), and only then the
+        // service - a failure before that brings the guard back, checked
+        let before = Expect::of(running_guard());
+        drop_guard(&mut rep, &sys::stop_service, &|| recover_guard(&before), &sys::remove_service)?;
         rep.ok("guard service removed (not chosen)");
     }
 
@@ -556,7 +558,7 @@ pub fn setup(mut o: Options) -> Result<(), String> {
 ///
 /// On any failure `restart` starts the guard again (it puts its rules and the
 /// redirect back), and the error says what state the PC is in.
-fn remove_firewall_parts(rep: &mut Report, restart: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+fn remove_firewall_parts(rep: &mut Report, restart: &dyn Fn() -> Result<String, String>) -> Result<(), String> {
     let steps = |rep: &mut Report| -> Result<(), String> {
         firewall::dns_capture(false).map_err(|e| format!("could not remove the DNS redirect ({e})"))?;
         match firewall::dns_capture_active() {
@@ -574,57 +576,128 @@ fn remove_firewall_parts(rep: &mut Report, restart: &dyn Fn() -> Result<(), Stri
         Ok(())
     };
     steps(rep).map_err(|e| match restart() {
-        Ok(()) => format!(
-            "{e} - teardown stopped; the guard was started again, so its block and DNS are back as before. \
-             Fix the cause and run teardown again"
-        ),
+        Ok(seen) => format!("{e} - stopped there; the guard was started again and checked: {seen}. Fix the cause and try again"),
         Err(r) => format!(
-            "{e} - teardown stopped, and the guard could not be started again ({r}). \
-             If you are offline or lookups fail: run `pialite-guard unlock` as admin"
+            "{e} - stopped there, and the guard's protection could NOT be confirmed ({r}). The block or DNS may be \
+             half removed: if you are offline or lookups fail, run `pialite-guard unlock` as admin"
         ),
     })
+}
+
+/// The guard service is stopped, its DNS redirect and block removed and
+/// checked, and only then the service itself (`remove`). A failed step
+/// before that calls `recover` (review G97-01).
+fn drop_guard(
+    rep: &mut Report,
+    stop: &dyn Fn() -> Result<(), String>,
+    recover: &dyn Fn() -> Result<String, String>,
+    remove: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    stop()?;
+    remove_firewall_parts(rep, recover)?;
+    remove()
+}
+
+/// What the running guard must show: `version` / `mode` when known (None =
+/// any), its block in place unless the mode is Off, and the DNS block /
+/// redirect on when `dns_on`.
+#[derive(Clone, Debug, Default)]
+struct Expect {
+    version: Option<String>,
+    mode: Option<BlockMode>,
+    dns_on: bool,
+}
+
+impl Expect {
+    /// "As it was": what the guard showed before (nothing known = it must
+    /// answer and have the block of whatever mode it reports in place).
+    fn of(before: Option<pialite_common::status::GuardStatus>) -> Expect {
+        match before {
+            None => Expect::default(),
+            Some(st) => Expect { version: Some(st.version), mode: Some(st.mode), dns_on: st.dns_only_guard == Some(true) },
+        }
+    }
+}
+
+/// The guard's status, if it answers within a few seconds.
+fn running_guard() -> Option<pialite_common::status::GuardStatus> {
+    sys::service_running().then(|| sys::wait_for_guard(Duration::from_secs(5)).ok()).flatten()
+}
+
+/// Start the guard again after a failed removal step and confirm it really
+/// took over again (review G97-02): Ok(what was seen), Err(why not).
+fn recover_guard(want: &Expect) -> Result<String, String> {
+    sys::start_service().map_err(|e| format!("it could not be started: {e}"))?;
+    let st = wait_ready(&sys::wait_for_guard, want, Duration::from_secs(30))?;
+    Ok(describe_guard(&st))
+}
+
+fn describe_guard(st: &pialite_common::status::GuardStatus) -> String {
+    format!(
+        "version {} answering, block mode {}{}{}",
+        st.version,
+        st.mode.as_str(),
+        if st.mode != BlockMode::Off && st.armed { " with its block in place" } else { "" },
+        if st.dns_only_guard == Some(true) { ", DNS only through the guard" } else { "" }
+    )
 }
 
 /// The guard answers - THIS version, with the block mode just saved - and,
 /// unless that mode is Off, has its block in place (review V95-06, F-01).
 fn wait_until_armed(want: BlockMode, limit: Duration) -> Result<pialite_common::status::GuardStatus, String> {
+    let want = Expect { version: Some(env!("CARGO_PKG_VERSION").to_string()), mode: Some(want), dns_on: false };
+    wait_ready(&sys::wait_for_guard, &want, limit)
+}
+
+/// Ask `status` until the guard shows what `want` says, or `limit` is up
+/// (Err = why it doesn't).
+fn wait_ready(
+    status: &dyn Fn(Duration) -> Result<pialite_common::status::GuardStatus, String>,
+    want: &Expect,
+    limit: Duration,
+) -> Result<pialite_common::status::GuardStatus, String> {
     let until = std::time::Instant::now() + limit;
     loop {
         let left = until.saturating_duration_since(std::time::Instant::now());
-        let st = sys::wait_for_guard(left.max(Duration::from_secs(1)))
-            .map_err(|e| format!("{e} - PIA Lite is NOT set up (see the guard log)"))?;
-        if let Some(why) = not_ready(&st, want, env!("CARGO_PKG_VERSION")) {
-            if std::time::Instant::now() >= until {
-                return Err(format!("{why} - PIA Lite is NOT set up"));
-            }
-            std::thread::sleep(Duration::from_millis(500));
-            continue;
+        let st = status(left.max(Duration::from_secs(1))).map_err(|e| format!("{e} (see the guard log)"))?;
+        match not_ready(&st, want) {
+            None => return Ok(st),
+            Some(why) if std::time::Instant::now() >= until => return Err(why),
+            Some(_) => std::thread::sleep(Duration::from_millis(500)),
         }
-        return Ok(st);
     }
 }
 
-/// Why the running guard isn't what setup just installed (None = it is):
-/// another version, another block mode than the one saved, or that mode's
-/// block not in place. Exact match only - a stronger mode than asked for is
-/// still "not what was set up".
-fn not_ready(st: &pialite_common::status::GuardStatus, want: BlockMode, version: &str) -> Option<String> {
-    if st.version != version {
+/// Why the running guard doesn't show what `want` says (None = it does).
+/// Exact matches only - a stronger mode than asked for is still "not it".
+fn not_ready(st: &pialite_common::status::GuardStatus, want: &Expect) -> Option<String> {
+    if let Some(v) = &want.version {
+        if &st.version != v {
+            return Some(format!(
+                "the guard service runs version {} instead of {v}",
+                if st.version.is_empty() { "?" } else { &st.version }
+            ));
+        }
+    }
+    if let Some(m) = want.mode {
+        if st.mode != m {
+            return Some(format!("the guard service runs with block mode {} instead of {}", st.mode.as_str(), m.as_str()));
+        }
+    }
+    if st.mode != BlockMode::Off && !st.armed {
         return Some(format!(
-            "the guard service runs version {} instead of {version}",
-            if st.version.is_empty() { "?" } else { &st.version }
+            "the guard could not put the internet block ({}) in place: {}",
+            st.mode.as_str(),
+            if st.fw_error.is_empty() { "see the guard log" } else { &st.fw_error }
         ));
     }
-    if st.mode != want {
-        return Some(format!("the guard service runs with block mode {} instead of {}", st.mode.as_str(), want.as_str()));
+    if want.dns_on && st.dns_only_guard != Some(true) {
+        return Some(format!(
+            "the guard's DNS block/redirect isn't on again{}",
+            if st.dns_only_guard_note.is_empty() { String::new() } else { format!(" ({})", st.dns_only_guard_note) }
+        ));
     }
-    (want != BlockMode::Off && !st.armed).then(|| {
-        format!(
-            "the guard could not put the internet block ({}) in place: {}",
-            want.as_str(),
-            if st.fw_error.is_empty() { "see the guard log" } else { &st.fw_error }
-        )
-    })
+    None
 }
 
 fn pia_present() -> bool {
@@ -923,15 +996,18 @@ pub fn teardown(keep_config: bool) -> Result<(), String> {
     let mut rep = Report { lines: vec![], warnings: vec![] };
     println!("Removing PIA Lite's system parts...");
     let record = sys::read_record();
-    // 1. the guard first, so it can't put rules back while they're removed
+    // 1. the guard first, so it can't put rules back while they're removed;
+    //    what it showed now is what "back as before" means if a step fails
     let was_running = sys::service_running();
+    let before = Expect::of(running_guard());
     sys::stop_service()?;
     if was_running {
         rep.ok("guard service stopped");
     }
     // 2. DNS redirect, then the block - each checked; a failure starts the
-    //    guard again, so the PC is protected and has DNS as before (F-02)
-    remove_firewall_parts(&mut rep, &|| if was_running { sys::start_service() } else { Err("it wasn't running before".into()) })?;
+    //    guard again and checks it took over again (F-02, G97-02) - also
+    //    when it wasn't running: a half-removed block is worse than the guard
+    remove_firewall_parts(&mut rep, &|| recover_guard(&before))?;
     // 3. PIA as it was: DNS, kill switch (an unfinished hotel login), NextDNS app, startup task
     restore_pia_dns(&mut rep);
     match sys::restore_adapter_dns() {
@@ -1188,17 +1264,85 @@ mod tests {
         use pialite_common::status::GuardStatus;
         let v = "9.9.9";
         let st = |mode, armed, err: &str| GuardStatus { version: v.into(), mode, armed, fw_error: err.into(), ..Default::default() };
-        assert!(not_ready(&st(BlockMode::Off, false, ""), BlockMode::Off, v).is_none(), "Off asked, Off running");
-        assert!(not_ready(&st(BlockMode::Startup, true, ""), BlockMode::Startup, v).is_none());
-        let why = not_ready(&st(BlockMode::Always, false, "Adding rule 'x' failed"), BlockMode::Always, v).unwrap();
+        let want = |mode| Expect { version: Some(v.into()), mode: Some(mode), dns_on: false };
+        assert!(not_ready(&st(BlockMode::Off, false, ""), &want(BlockMode::Off)).is_none(), "Off asked, Off running");
+        assert!(not_ready(&st(BlockMode::Startup, true, ""), &want(BlockMode::Startup)).is_none());
+        let why = not_ready(&st(BlockMode::Always, false, "Adding rule 'x' failed"), &want(BlockMode::Always)).unwrap();
         assert!(why.contains("always") && why.contains("Adding rule"), "{why}");
-        assert!(not_ready(&st(BlockMode::Startup, false, ""), BlockMode::Startup, v).unwrap().contains("guard log"));
+        assert!(not_ready(&st(BlockMode::Startup, false, ""), &want(BlockMode::Startup)).unwrap().contains("guard log"));
         // Always asked, the service says Off: not set up (it was "fine" before)
-        let why = not_ready(&st(BlockMode::Off, false, ""), BlockMode::Always, v).unwrap();
+        let why = not_ready(&st(BlockMode::Off, false, ""), &want(BlockMode::Always)).unwrap();
         assert!(why.contains("mode off instead of always"), "{why}");
-        assert!(not_ready(&st(BlockMode::Always, true, ""), BlockMode::Startup, v).is_some(), "not even a stronger mode");
+        assert!(not_ready(&st(BlockMode::Always, true, ""), &want(BlockMode::Startup)).is_some(), "not even a stronger mode");
         let old = GuardStatus { version: "0.9.5".into(), mode: BlockMode::Startup, armed: true, ..Default::default() };
-        assert!(not_ready(&old, BlockMode::Startup, v).unwrap().contains("version 0.9.5 instead of 9.9.9"));
+        assert!(not_ready(&old, &want(BlockMode::Startup)).unwrap().contains("version 0.9.5 instead of 9.9.9"));
+    }
+
+    #[test]
+    fn recovery_is_reported_only_when_it_is_seen() {
+        // review G97-02: "started" is not "back as before" - the guard must
+        // answer with the mode, block and DNS block it had before
+        use pialite_common::status::GuardStatus;
+        use std::time::Duration;
+        let short = Duration::from_millis(600);
+        let before =
+            GuardStatus { version: "1.0".into(), mode: BlockMode::Always, armed: true, dns_only_guard: Some(true), ..Default::default() };
+        let want = Expect::of(Some(before.clone()));
+        assert!(want.dns_on && want.mode == Some(BlockMode::Always));
+        // answers as before: confirmed, and said what was seen
+        let st = wait_ready(&|_| Ok(before.clone()), &want, short).unwrap();
+        assert!(describe_guard(&st).contains("always with its block in place, DNS only through the guard"), "{}", describe_guard(&st));
+        // started but never answers
+        let e = wait_ready(&|_| Err("the guard service didn't answer within 1 s".into()), &want, short).unwrap_err();
+        assert!(e.contains("didn't answer"), "{e}");
+        // answers, block not armed / DNS block not back / another mode
+        let unarmed = GuardStatus { armed: false, fw_error: "nft: busy".into(), ..before.clone() };
+        assert!(wait_ready(&|_| Ok(unarmed.clone()), &want, short).unwrap_err().contains("nft: busy"));
+        let no_dns =
+            GuardStatus { dns_only_guard: Some(false), dns_only_guard_note: "the DNS proxy isn't listening".into(), ..before.clone() };
+        assert!(wait_ready(&|_| Ok(no_dns.clone()), &want, short).unwrap_err().contains("DNS block/redirect isn't on again"));
+        let off = GuardStatus { mode: BlockMode::Off, ..before.clone() };
+        assert!(wait_ready(&|_| Ok(off.clone()), &want, short).unwrap_err().contains("instead of always"));
+        // nothing known from before: it must answer, with its block in place
+        let anyhow = Expect::of(None);
+        assert!(wait_ready(&|_| Ok(unarmed.clone()), &anyhow, short).is_err());
+        assert!(wait_ready(&|_| Ok(off.clone()), &anyhow, short).is_ok());
+        // and the message never says "back" without it
+        let _g = config::tests::ENV_LOCK.lock().unwrap();
+        let mut rep = Report { lines: vec![], warnings: vec![] };
+        firewall::fail_next_uninstall();
+        let e = remove_firewall_parts(&mut rep, &|| Err("didn't answer".into())).unwrap_err();
+        assert!(e.contains("could NOT be confirmed (didn't answer)") && e.contains("unlock"), "{e}");
+    }
+
+    #[test]
+    fn removing_the_guard_feature_keeps_the_protected_order() {
+        // review G97-01: the service goes last; a failed firewall step brings
+        // the guard back instead of leaving rules with nobody to look after them
+        let _g = config::tests::ENV_LOCK.lock().unwrap();
+        let mut rep = Report { lines: vec![], warnings: vec![] };
+        let order = std::cell::RefCell::new(vec![]);
+        let stop = || {
+            order.borrow_mut().push("stop");
+            Ok(())
+        };
+        let recover = || {
+            order.borrow_mut().push("recover");
+            Ok("seen".to_string())
+        };
+        let remove = || {
+            order.borrow_mut().push("remove");
+            Ok(())
+        };
+        firewall::install(&firewall::plan(&[], false)).unwrap();
+        firewall::fail_next_uninstall();
+        assert!(drop_guard(&mut rep, &stop, &recover, &remove).is_err());
+        assert_eq!(*order.borrow(), ["stop", "recover"], "the service was NOT removed");
+        assert_eq!(firewall::installed(), Ok(true));
+        order.borrow_mut().clear();
+        drop_guard(&mut rep, &stop, &recover, &remove).unwrap();
+        assert_eq!(*order.borrow(), ["stop", "remove"]);
+        assert_eq!(firewall::installed(), Ok(false));
     }
 
     #[test]
@@ -1238,7 +1382,7 @@ mod tests {
         let restarted = std::cell::Cell::new(0);
         let restart = || {
             restarted.set(restarted.get() + 1);
-            Ok(())
+            Ok("version 1 answering".to_string())
         };
         let block = || firewall::install(&firewall::plan(&[], false)).map(|_| ()).unwrap();
         // the DNS redirect can't be removed: nothing else is touched
@@ -1247,7 +1391,7 @@ mod tests {
         firewall::fail_dns_capture(true);
         let e = remove_firewall_parts(&mut rep, &restart).unwrap_err();
         firewall::fail_dns_capture(false);
-        assert!(e.contains("DNS redirect") && e.contains("started again"), "{e}");
+        assert!(e.contains("DNS redirect") && e.contains("started again and checked: version 1 answering"), "{e}");
         assert_eq!(restarted.get(), 1);
         assert_eq!(firewall::installed(), Ok(true), "the block was left in place");
         // the block can't be removed
@@ -1258,7 +1402,7 @@ mod tests {
         // ...and if the guard can't start again either, the way out is named
         firewall::fail_next_uninstall();
         let e = remove_firewall_parts(&mut rep, &|| Err("no unit".into())).unwrap_err();
-        assert!(e.contains("could not be started again (no unit)") && e.contains("unlock"), "{e}");
+        assert!(e.contains("could NOT be confirmed (no unit)") && e.contains("unlock"), "{e}");
         // all fine: everything removed and checked, nothing restarted
         firewall::dns_capture(true).unwrap();
         remove_firewall_parts(&mut rep, &restart).unwrap();

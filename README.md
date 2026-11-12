@@ -198,6 +198,10 @@ release exists. If so, the menu and the panel show **Install update x.y.z**:
 The portable versions just point you to the download page. To turn the check off, set the environment variable
 `PIALITE_NO_UPDATE_CHECK=1`. From a terminal: `pialite-guard check-update` / `pialite-guard apply-update` (admin).
 
+Every release from 0.9.8 on is signed (a release can't be published unsigned), and before publishing, the release
+job checks it with the packaged program itself: `pialite-guard verify-release FOLDER` - the same check the
+updater makes. You can run it on a folder with the downloaded files and `SHA256SUMS` + `SHA256SUMS.sig`.
+
 ## Stuck offline?
 
 The kill switch is designed to fail closed, so if something goes wrong you may have no internet until the VPN

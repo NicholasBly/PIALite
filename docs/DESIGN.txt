@@ -491,3 +491,13 @@ What is protected, from what, and what is NOT claimed.
    bounded. Linux data files 0600 (install.json 0644), links / hard links
    refused, owner root. Windows: reparse points on the program path are
    refused. install.sh: "can't inspect" is never "clean".
+   0.9.8 (review G97): removing the guard feature = stop -> DNS redirect
+   and block off (checked) -> remove the service; any failed step restarts
+   the guard and waits until it shows what it showed before (version, mode,
+   armed, DNS block) - only then "back as before". Windows DNS block
+   rebuilds under the other of two sublayer keys and drops the old block
+   only after the new one checks out. run_within logs a missing job object.
+   install.sh --upgrade: stop must succeed; bin/ kept as bin.previous until
+   setup succeeds, else restored and the old guard started. Releases: the
+   publish job fails without the signing key, and the packaged guard's
+   verify-release must accept the release and refuse a tampered package.

@@ -469,6 +469,10 @@ mod stub {
         Ok(DNS_CAPTURE.load(std::sync::atomic::Ordering::SeqCst))
     }
     #[allow(dead_code)]
+    pub fn dns_block_fail_next_rebuild_for_test() {
+        DNS_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[allow(dead_code)]
     pub fn dns_block_damage_for_test(_how: u8) -> Result<(), String> {
         DNS_CAPTURE.store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -2060,7 +2064,13 @@ mod win {
     /// Its own sublayer in a temporary (dynamic) WFP session, no provider: the
     /// internet block's checks don't see it, and if the guard stops, Windows
     /// removes it by itself - it can never leave the PC without DNS.
-    const DNS_SUBLAYER: GUID = GUID::from_u128(0x5a1f7e2c_3b4d_4c8a_9e61_2f0b6d1c7a03);
+    /// Two keys, used in turn: a replacement block is built under the other
+    /// key while the old one still stands, and only then is the old one
+    /// dropped (review G97-03).
+    const DNS_SUBLAYERS: [GUID; 2] =
+        [GUID::from_u128(0x5a1f7e2c_3b4d_4c8a_9e61_2f0b6d1c7a03), GUID::from_u128(0x5a1f7e2c_3b4d_4c8a_9e61_2f0b6d1c7a04)];
+    /// selftest-firewall only: make the next rebuild fail halfway.
+    static FAIL_NEXT_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// One rule of the DNS block, as planned.
     #[derive(Clone)]
@@ -2075,6 +2085,7 @@ mod win {
     /// The session holding the DNS block, and the id Windows gave each rule.
     struct DnsBlock {
         e: Engine,
+        key: GUID,
         rules: Vec<(u64, DnsRule)>,
     }
     static DNS_BLOCK: std::sync::Mutex<Option<DnsBlock>> = std::sync::Mutex::new(None);
@@ -2098,22 +2109,22 @@ mod win {
         v
     }
 
-    fn dns_sublayer_there(e: &Engine) -> bool {
+    fn dns_sublayer_there(e: &Engine, key: &GUID) -> bool {
         let mut s: *mut FWPM_SUBLAYER0 = null_mut();
-        let found = unsafe { FwpmSubLayerGetByKey0(e.0, &DNS_SUBLAYER, &mut s) } == 0 && !s.is_null();
+        let found = unsafe { FwpmSubLayerGetByKey0(e.0, key, &mut s) } == 0 && !s.is_null();
         if found {
             unsafe { FwpmFreeMemory0(&mut s as *mut _ as *mut *mut c_void) };
         }
         found
     }
 
-    fn add_dns_filter(e: &Engine, r: &DnsRule) -> Result<u64, String> {
+    fn add_dns_filter(e: &Engine, key: &GUID, r: &DnsRule) -> Result<u64, String> {
         let mut conds = build(&r.cond, r.v6)?;
         let wname = wide(&format!("PIA Lite: {}", r.name));
         let mut f = FWPM_FILTER0::default();
         f.displayData.name = wname.as_ptr() as *mut u16;
         f.layerKey = layer(r.v6);
-        f.subLayerKey = DNS_SUBLAYER;
+        f.subLayerKey = *key;
         f.weight = FWP_VALUE0 { r#type: FWP_UINT8, Anonymous: FWP_VALUE0_0 { uint8: r.weight } };
         f.numFilterConditions = conds.list.len() as u32;
         f.filterCondition = if conds.list.is_empty() { null_mut() } else { conds.list.as_mut_ptr() };
@@ -2128,7 +2139,7 @@ mod win {
     /// and nothing else in the sublayer. Ok(Some(what differs)), Ok(None) =
     /// intact, Err = Windows couldn't be asked.
     fn dns_block_differs(b: &DnsBlock) -> Result<Option<String>, String> {
-        if !dns_sublayer_there(&b.e) {
+        if !dns_sublayer_there(&b.e, &b.key) {
             return Ok(Some("its sublayer is gone".into()));
         }
         const RISKY: u32 =
@@ -2147,7 +2158,7 @@ mod win {
             let action = if r.permit { FWP_ACTION_PERMIT } else { FWP_ACTION_BLOCK };
             let why = if !same_guid(&f.layerKey, &layer(r.v6)) {
                 Some("layer")
-            } else if !same_guid(&f.subLayerKey, &DNS_SUBLAYER) {
+            } else if !same_guid(&f.subLayerKey, &b.key) {
                 Some("sublayer")
             } else if f.action.r#type != action {
                 Some("action")
@@ -2165,7 +2176,7 @@ mod win {
         let mut count = 0usize;
         for v6 in [false, true] {
             list(&b.e, v6, None, 0, |f| {
-                if same_guid(&f.subLayerKey, &DNS_SUBLAYER) {
+                if same_guid(&f.subLayerKey, &b.key) {
                     count += 1;
                 }
             })?;
@@ -2182,20 +2193,38 @@ mod win {
             *held = None; // closing the session removes its sublayer and rules
             return Ok(());
         }
+        let mut damaged = String::new();
         if let Some(b) = held.as_ref() {
             match dns_block_differs(b) {
                 Ok(None) => return Ok(()),
-                Ok(Some(why)) => crate::config::log(&format!("the DNS block isn't intact ({why}) - adding it again")),
-                Err(e) => crate::config::log(&format!("could not check the DNS block ({e}) - adding it again")),
+                Ok(Some(why)) => damaged = why,
+                Err(e) => damaged = format!("could not check it: {e}"),
             }
+            crate::config::log(&format!("the DNS block isn't intact ({damaged}) - building a new one next to it"));
         }
-        *held = None; // a damaged block goes with its session
+        // the replacement under the other key, checked, BEFORE the old one goes:
+        // if it can't be built, what is left of the old block stays (G97-03)
+        let key = match held.as_ref() {
+            Some(b) if same_guid(&b.key, &DNS_SUBLAYERS[0]) => DNS_SUBLAYERS[1],
+            _ => DNS_SUBLAYERS[0],
+        };
+        match build_dns_block(key) {
+            Ok(b) => {
+                *held = Some(b); // drops the old block's session
+                Ok(())
+            }
+            Err(e) if held.is_some() => Err(format!("{e} - the old DNS block ({damaged}) stays in place until it can be replaced")),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn build_dns_block(key: GUID) -> Result<DnsBlock, String> {
         let e = Engine::open(true)?;
         let plan = dns_plan();
         let sname = wide("PIA Lite: plain DNS only through the guard");
         let rules = e.txn_as("Adding the DNS block", || {
             let s = FWPM_SUBLAYER0 {
-                subLayerKey: DNS_SUBLAYER,
+                subLayerKey: key,
                 displayData: FWPM_DISPLAY_DATA0 { name: sname.as_ptr() as *mut u16, description: null_mut() },
                 weight: SUBLAYER_WEIGHT - 1,
                 ..Default::default()
@@ -2203,16 +2232,18 @@ mod win {
             check("Adding the DNS block's sublayer", unsafe { FwpmSubLayerAdd0(e.0, &s, null_mut()) })?;
             let mut rules = vec![];
             for r in &plan {
-                rules.push((add_dns_filter(&e, r)?, r.clone()));
+                rules.push((add_dns_filter(&e, &key, r)?, r.clone()));
+                if FAIL_NEXT_BUILD.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return Err("injected: the DNS block could not be built (test)".to_string());
+                }
             }
             Ok(rules)
         })?;
-        let b = DnsBlock { e, rules };
+        let b = DnsBlock { e, key, rules };
         if let Some(why) = dns_block_differs(&b)? {
             return Err(format!("the DNS block isn't as planned right after adding it ({why})"));
         }
-        *held = Some(b);
-        Ok(())
+        Ok(b)
     }
 
     /// The DNS block is there AND intact (every rule checked, nothing extra).
@@ -2236,9 +2267,14 @@ mod win {
             }
             _ => {
                 let r = DnsRule { v6: false, weight: 15, permit: true, cond: Cond::All, name: "TEST stray permit".into() };
-                add_dns_filter(&b.e, &r).map(|_| ())
+                add_dns_filter(&b.e, &b.key, &r).map(|_| ())
             }
         }
+    }
+
+    /// selftest-firewall only: the next rebuild of the DNS block fails halfway.
+    pub fn dns_block_fail_next_rebuild_for_test() {
+        FAIL_NEXT_BUILD.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn open_all() -> Result<OpenAll, String> {

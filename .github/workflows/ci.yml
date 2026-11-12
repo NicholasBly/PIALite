@@ -42,6 +42,8 @@ jobs:
         run: sudo unshare --net ./target/release/pialite-guard selftest-firewall
       - name: install.sh --uninstall never says "removed" unchecked (fake nft/systemctl)
         run: sudo sh tests/install-sh-uninstall.sh
+      - name: install.sh --upgrade puts the previous version back if setup fails (fake tools)
+        run: sudo sh tests/install-sh-upgrade.sh
       - name: Packages (.deb, .rpm, .tar.gz)
         run: packaging/linux/build-packages.sh "$(grep -m1 '^version' pialite-guard/Cargo.toml | cut -d'"' -f2)"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -50,6 +52,7 @@ jobs:
           path: dist/*
       # after the upload: from here on this machine's DNS goes through PIA Lite
       - name: Install the .deb and set up the guard (systemd, DNS redirect)
+        id: install
         run: |
           sudo apt-get install -y ./dist/pialite_*_amd64.deb
           sudo pialite-guard setup --features guard,dns --dns quad9 --mode off
@@ -69,13 +72,17 @@ jobs:
             sudo pialite-guard test-doh
           done
           getent hosts github.com
+      # only after an install was started (an earlier failure stays the one reported, G97-08)
       - name: Remove the package (teardown) and check nothing is left
-        if: always()
+        if: always() && steps.install.outcome != 'skipped'
         run: |
           rc=0
           sudo apt-get remove -y pialite || rc=$?
-          if sudo nft list tables | grep -q pialite; then sudo nft list ruleset; echo "PIA Lite tables left behind"; exit 1; fi
-          if systemctl list-unit-files | grep -q pialite-guard; then echo "service left behind"; exit 1; fi
+          # "can't look" is a failure, not "nothing there"
+          tables=$(sudo nft list tables) || { echo "nftables can't be inspected"; exit 1; }
+          if printf '%s\n' "$tables" | grep -q pialite; then sudo nft list ruleset; echo "PIA Lite tables left behind"; exit 1; fi
+          units=$(systemctl list-unit-files --no-legend) || { echo "systemd can't be asked"; exit 1; }
+          if printf '%s\n' "$units" | grep -q pialite-guard; then echo "service left behind"; exit 1; fi
           # "remove" keeps the config: "deinstall ok config-files" is gone, "install ok installed" is not
           if [ "$(dpkg-query -W -f='${Status}' pialite 2>/dev/null)" = "install ok installed" ]; then echo "package still installed"; exit 1; fi
           if [ "$rc" -ne 0 ]; then echo "apt-get remove failed ($rc)"; exit 1; fi
@@ -128,13 +135,19 @@ jobs:
         shell: pwsh
         run: |
           $v = (Select-String -Path pialite-guard\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          ./packaging/windows/build.ps1 -Version $v
-          wix msi validate (Get-Item dist\*.msi).FullName
+          # ICE warnings fail the build now that there are none left (G97-07)
+          $out = ./packaging/windows/build.ps1 -Version $v *>&1 | Out-String
+          $out
+          if ($out -match 'ICE\d+') { throw "the MSI build reported ICE warnings" }
+          $val = wix msi validate (Get-Item dist\*.msi).FullName *>&1 | Out-String
+          $val
+          if ($LASTEXITCODE -ne 0 -or $val -match 'ICE\d+') { throw "MSI validation reported problems" }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: windows-packages
           path: dist/*
       - name: Silent install (PIA isn't on this machine - its check is skipped)
+        id: install
         shell: pwsh
         run: |
           $msi = (Get-Item dist\*.msi).FullName
@@ -152,8 +165,17 @@ jobs:
           if ((Get-Service PiaLiteGuard).Status -ne 'Running') { throw "service not running" }
           schtasks /Query /TN "PIA Lite Tray"
           if ($LASTEXITCODE -ne 0) { throw "sign-in task not found" }
+          # Start menu shortcuts exist and point at the installed programs
+          $sh = New-Object -ComObject WScript.Shell
+          $menu = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\PIA Lite"
+          foreach ($l in @(@('PIA Lite.lnk', 'pialite-tray.exe'), @('PIA Lite - Unlock Internet.lnk', 'pialite-guard.exe'))) {
+            $f = Join-Path $menu $l[0]
+            if (-not (Test-Path $f)) { Get-ChildItem $menu -ErrorAction SilentlyContinue; throw "shortcut missing: $f" }
+            $t = $sh.CreateShortcut($f).TargetPath
+            if ($t -ne "$env:ProgramFiles\PiaLite\$($l[1])") { throw "$($l[0]) points at '$t'" }
+          }
       - name: Uninstall and check nothing is left
-        if: always()
+        if: always() && steps.install.outcome != 'skipped'
         shell: pwsh
         run: |
           $msi = (Get-Item dist\*.msi).FullName
@@ -164,6 +186,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "block rules left behind" }
           if (Test-Path "$env:ProgramFiles\PiaLite") { Get-ChildItem "$env:ProgramFiles\PiaLite"; throw "files left behind" }
           if (Test-Path "$env:ProgramData\PiaLite") { Get-ChildItem "$env:ProgramData\PiaLite"; throw "data folder left behind" }
+          if (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\PIA Lite") { throw "Start menu shortcuts left behind" }
       - name: Installer logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

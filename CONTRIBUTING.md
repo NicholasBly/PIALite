@@ -22,6 +22,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 sudo unshare --net target/debug/pialite-guard selftest-firewall   # Linux, real nftables in a throwaway namespace
 sudo sh tests/install-sh-uninstall.sh                             # Linux, install.sh's uninstall checks (fake tools)
+sudo sh tests/install-sh-upgrade.sh                               # Linux, install.sh's upgrade rollback (fake tools)
 ```
 
 `selftest-firewall` replaces PIA Lite's real firewall rules: on Windows it refuses to run where PIA Lite is

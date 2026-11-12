@@ -80,11 +80,13 @@
       </Component>
     </ComponentGroup>
 
+    <!-- targets by folder + name, not [#File] of another component (ICE69,
+         review G97-07); both programs are always installed with the shortcuts -->
     <Component Id="MenuShortcuts" Directory="MenuFolder" Guid="11753345-84EB-4126-A987-3090C92F08F2">
       <Shortcut Id="TrayShortcut" Name="PIA Lite" Description="Lightweight tray for Private Internet Access"
-                Target="[#TrayExe]" WorkingDirectory="INSTALLFOLDER" Icon="pialite.ico" />
+                Target="[INSTALLFOLDER]pialite-tray.exe" WorkingDirectory="INSTALLFOLDER" Icon="pialite.ico" />
       <Shortcut Id="UnlockShortcut" Name="PIA Lite - Unlock Internet" Description="Emergency: turn PIA Lite's internet block off (asks for admin)"
-                Target="[#GuardExe]" Arguments="unlock --pause" WorkingDirectory="INSTALLFOLDER" />
+                Target="[INSTALLFOLDER]pialite-guard.exe" Arguments="unlock --pause" WorkingDirectory="INSTALLFOLDER" />
       <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
       <RegistryValue Root="HKCU" Key="Software\PIA Lite" Name="Shortcuts" Type="integer" Value="1" KeyPath="yes" />
     </Component>

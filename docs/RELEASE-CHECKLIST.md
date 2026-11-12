@@ -10,6 +10,8 @@ these runs are the evidence. Keep PIA's own kill switch **on** in normal use: it
       `setup` + `test-dns` + removal leaving nothing behind
 - [ ] Windows: clippy, tests, `selftest-firewall` (real WFP), MSI build + ICE validation, silent install +
       uninstall leaving nothing behind
+- [ ] Publish (automatic: it runs only after both CI jobs pass): `SHA256SUMS` signed, and the packaged
+      `pialite-guard verify-release` accepts the release and refuses a tampered package
 
 ## 2. Windows (on a real PC with PIA)
 

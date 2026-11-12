@@ -4,7 +4,7 @@ name: Release
 # no GitHub release yet (or a tag vX.Y.Z is pushed), the whole CI workflow
 # runs (ci.yml: tests, firewall self-tests, packages, real install/uninstall);
 # only if all of it passes are its packages published, with SHA256SUMS signed
-# (if the RELEASE_SIGNING_KEY secret is set). Pushes that don't change the
+# (required: no RELEASE_SIGNING_KEY secret, no release). Pushes that don't change the
 # version stop after one quick check.
 
 on:
@@ -83,14 +83,14 @@ jobs:
           diff -u want.txt have.txt
       - name: Checksums
         run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
-      - name: Sign the checksums (the updater installs only signed releases)
+      - name: Sign the checksums (required - the updater installs only signed releases)
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
+          # an official release is always signed (review G97-06): no key, no release
           if [ -z "$RELEASE_SIGNING_KEY" ]; then
-            echo "::warning::RELEASE_SIGNING_KEY is not set - this release is NOT signed; the updater will only point to the download page"
-            echo "unsigned" > "$RUNNER_TEMP/unsigned"
-            exit 0
+            echo "::error::RELEASE_SIGNING_KEY is not set - not publishing an unsigned release"
+            exit 1
           fi
           umask 077
           printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
@@ -99,6 +99,17 @@ jobs:
           # must match the public key built into the programs
           { printf '\060\052\060\005\006\003\053\145\160\003\041\000'; base64 -d keys/release-signing.pub; } > "$RUNNER_TEMP/pub.der"
           openssl pkeyutl -verify -pubin -keyform DER -inkey "$RUNNER_TEMP/pub.der" -rawin -in dist/SHA256SUMS -sigfile dist/SHA256SUMS.sig
+      - name: The packaged program accepts this release, and refuses a changed one
+        run: |
+          mkdir -p "$RUNNER_TEMP/pkg" && tar -xzf "dist/PIALite-$VERSION-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/pkg"
+          g=$(find "$RUNNER_TEMP/pkg" -type f -name pialite-guard -perm -u+x | head -n1)
+          test -n "$g"
+          "$g" verify-release dist
+          # the same check must fail on a tampered package
+          cp -r dist "$RUNNER_TEMP/tampered"
+          printf 'x' >> "$RUNNER_TEMP/tampered/pialite_${VERSION}_amd64.deb"
+          if "$g" verify-release "$RUNNER_TEMP/tampered"; then echo "a changed package was accepted"; exit 1; fi
+          echo "tampered package refused, as it must be"
       - name: Release notes from CHANGELOG.md
         run: |
           v="$VERSION"
@@ -114,11 +125,7 @@ jobs:
             echo "| Fedora / openSUSE / RHEL | \`pialite-$v-1.x86_64.rpm\` |"
             echo "| Any Linux (install.sh or portable) | \`PIALite-$v-linux-x86_64.tar.gz\` |"
             echo
-            if [ -f "$RUNNER_TEMP/unsigned" ]; then
-              echo "Checksums: \`SHA256SUMS\`. **This release is not signed** - PIA Lite's built-in updater won't install it; download it here instead."
-            else
-              echo "Checksums: \`SHA256SUMS\` (signed: \`SHA256SUMS.sig\`, ed25519 key in \`keys/release-signing.pub\`)."
-            fi
+            echo "Checksums: \`SHA256SUMS\` (signed: \`SHA256SUMS.sig\`, ed25519 key in \`keys/release-signing.pub\`)."
           } >> notes.md
           cat notes.md
       - name: Publish

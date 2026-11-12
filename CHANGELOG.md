@@ -2,6 +2,38 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.8] - 2026-11-12
+
+Fixes from the independent v0.9.7 review (G97-01 .. G97-09). **The first signed release.**
+
+### Fixed
+- **Turning the guard feature off uses the same protected order as uninstalling** (G97-01): the guard is
+  stopped, its DNS redirect and block removed and checked, and only then is the service removed - a failed step
+  brings the guard back instead of leaving rules with nobody to look after them.
+- **"The guard is back" is said only when it is seen** (G97-02): after a failed removal step the guard is
+  started again and must answer with the version, block mode, armed block and DNS block it had before (or, if
+  it wasn't running, with its block in place); otherwise the message says protection could NOT be confirmed and
+  how to unlock. It is also started again when it wasn't running before - a half-removed block is worse.
+- **Windows: a damaged DNS block is replaced without a gap** (G97-03): the new block is built and checked next
+  to the old one (two sublayer keys used in turn), and only then is the old one dropped; if the new one can't
+  be built, what is left of the old one stays. The firewall self-test makes a rebuild fail on purpose and checks
+  the old block still stops a lookup.
+- **Windows: a program that can't be put in a job object is logged and named in timeout errors** (G97-04), so
+  "everything it started was stopped" is never claimed without it.
+- **install.sh --upgrade keeps the previous version until the new one is set up** (G97-05): a guard that won't
+  stop means nothing is replaced; a failed setup puts the previous programs back and starts the previous guard.
+  Tested in CI with fake tools.
+- **Start menu shortcuts** point at the programs by folder and name (WiX ICE69, G97-07); CI now checks both
+  shortcuts after installing and that they are gone after uninstalling, and fails on any ICE warning.
+- CI: the package/MSI removal runs only after an install was started (the first failure stays the one
+  reported), and "nftables / systemd can't be asked" fails the check instead of passing it (G97-08).
+
+### Changed
+- **Releases must be signed** (G97-06): without the signing key the publish job fails. Before publishing it
+  runs the packaged `pialite-guard verify-release` (the updater's own check, with the key built into the
+  program) on the release, and makes sure it refuses a tampered package. New command:
+  `pialite-guard verify-release FOLDER`.
+
 ## [0.9.7] - 2026-11-12
 
 Fixes from the independent v0.9.6 review (F-01 .. F-10).
