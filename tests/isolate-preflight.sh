@@ -16,6 +16,9 @@ if [ "${PIALITE_PREFLIGHT_NS:-}" != 1 ]; then
 fi
 if grep -q ' shared:' /proc/self/mountinfo; then echo "refusing: mounts are shared"; exit 1; fi
 case "$HERE" in /home/*) ;; *) echo "refusing: needs the checkout under /home (it is bound read-only into the test roots)"; exit 1 ;; esac
+# its own /tmp: the throwaway roots and output files never touch the real one (V11-03)
+mount -n -t tmpfs -o size=128m,mode=1777 preflight-tmp /tmp || { echo "refusing: could not make a private /tmp"; exit 1; }
+export TMPDIR=/tmp
 fails=0
 OUT=$(mktemp)
 
@@ -26,7 +29,7 @@ ro_bind() { # SRC DST: the same folder, read-only (a link is copied as a link)
     mount -n --bind "$1" "$2" && mount -n -o remount,bind,ro "$2" || { echo "refusing: could not bind $1 read-only"; exit 1; }
 }
 # root_without MISSING: a root with this system's folders read-only, except
-# MISSING (/opt, /usr/local, /var/lib or /run), which doesn't exist in it
+# MISSING (/opt, /usr/local, /var/lib, /run or /tmp), which doesn't exist in it
 root_without() {
     R=$(mktemp -d)
     mount -n -t tmpfs -o size=16m,mode=0755 preflight "$R"
@@ -45,7 +48,7 @@ root_without() {
         fi
     done
     [ "$1" = /run ] || mkdir "$R/run"
-    mkdir -m 1777 "$R/tmp"
+    [ "$1" = /tmp ] || mkdir -m 1777 "$R/tmp"
     mkdir "$R/proc" && mount -n -t proc proc "$R/proc"
     ro_bind /dev "$R/dev"
 }
@@ -59,7 +62,7 @@ case_() { # name, folder that must not appear, expected text, test script
 }
 
 # each folder the tests write under, missing: refused, and still missing
-for d in /opt /usr/local /var/lib /run; do
+for d in /opt /usr/local /var/lib /run /tmp; do
     root_without "$d"
     for t in install-sh-upgrade.sh install-sh-uninstall.sh; do
         case_ "$t refuses when $d is missing, and doesn't create it" "$d" "refusing: $d doesn't exist here" "$t"

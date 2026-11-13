@@ -1,6 +1,6 @@
 #!/bin/sh
 # install.sh --upgrade / --restore-previous (reviews G97-05, R98-02, R98-06,
-# N99-02 .. N99-06, R10-02 .. R10-05): the new version is staged and the
+# N99-02 .. N99-06, R10-02 .. R10-05, V11-01 .. V11-05): the new version is staged and the
 # version in use copied - complete and marked - before anything changes; a
 # guard that won't stop, an unfinished earlier recovery, a guard this script
 # can't put back, or another installer running means nothing is touched; ANY
@@ -24,7 +24,7 @@ check() { # name, condition...
     if "$@"; then echo "PASS: $name"; else echo "FAIL: $name"; fails=$((fails + 1)); sed 's/^/    | /' "$WORK/out"; fi
 }
 MENU=/usr/local/share/applications/pialite.desktop
-LOCK=/run/pialite-install.lock
+LOCK=/run/pialite-install/lock
 
 # the "new version" tarball: its guard's setup can fail (after changing the
 # settings), or wait at a barrier
@@ -59,20 +59,26 @@ case "\$1" in
     cat) [ ! -e $WORK/no-unit ] ;;
     show) cat $WORK/state ;;
     stop)
+        echo "systemctl stop" >> $WORK/order.log
+        [ -e $WORK/snap-stop ] && { rm -f $WORK/snap-stop; cp --sparse=always $WORK/opt.img $WORK/at-stop.img; }
         [ -e $WORK/fail-stop ] && exit 1
         echo inactive > $WORK/state
         [ ! -e $WORK/fail-stop-stopped ] ;;
-    start) touch $WORK/started; echo active > $WORK/state ;;
+    start)
+        [ -e $WORK/fail-start ] && exit 1
+        touch $WORK/started; echo active > $WORK/state ;;
     *) exit 0 ;;
 esac
 EOF
 # cp / install / ln / mv / sed, when the file's text is in the arguments (empty
 # = the next call), ONCE: fail-TOOL fails; kill-TOOL kills the installer
-# instead of running (like a power cut); kill-after-TOOL runs, then kills it
+# instead of running (like a power cut); kill-after-TOOL runs, then kills it;
+# snap-TOOL copies the disk image under /opt first (the power-cut test)
 for t in cp install ln mv sed; do
     cat > "$WORK/fake/$t" <<EOF
 #!/bin/sh
-for how in fail kill kill-after; do
+case "\$*" in *rollback*) echo "$t \$*" >> $WORK/order.log ;; esac
+for how in fail kill kill-after snap; do
     f=$WORK/\$how-$t
     [ -e "\$f" ] || continue
     want=\$(cat "\$f")
@@ -82,11 +88,23 @@ for how in fail kill kill-after; do
         fail) echo "$t: injected failure" >&2; exit 1 ;;
         kill) kill -9 \$PPID; exit 1 ;;
         kill-after) /bin/$t "\$@"; kill -9 \$PPID; exit 0 ;;
+        snap) cp --sparse=always $WORK/opt.img $WORK/at-$t.img ;;
     esac
 done
 exec /bin/$t "\$@"
 EOF
 done
+# sync: logs what is in place when it runs (the order of the barriers, V11-01);
+# kill-after-marker-sync kills the installer right after the sync that follows
+# its "guard-stopped" note - before the stop
+cat > "$WORK/fake/sync" <<EOF
+#!/bin/sh
+echo "sync part=\$([ -e /opt/pialite.rollback.part ] && echo 1 || echo 0) roll=\$([ -e /opt/pialite.rollback ] && echo 1 || echo 0) marker=\$([ -e /opt/pialite.rollback/guard-stopped ] && echo 1 || echo 0)" >> $WORK/order.log
+/bin/sync || exit 1
+if [ -e $WORK/kill-after-marker-sync ] && [ -e /opt/pialite.rollback/guard-stopped ]; then
+    rm -f $WORK/kill-after-marker-sync; kill -9 \$PPID
+fi
+EOF
 chmod +x "$WORK/fake/"*
 
 # a running previous version: block mode always, block in place, DNS only
@@ -95,7 +113,7 @@ chmod +x "$WORK/fake/"*
 old() {
     rm -rf /opt/pialite /opt/pialite.new /opt/pialite.rollback /opt/pialite.rollback.part /var/lib/pialite /usr/local/share \
         "$WORK"/fail-* "$WORK"/kill-* "$WORK"/started "$WORK"/status-after "$WORK"/status-before "$WORK"/no-unit \
-        "$WORK"/hold-setup "$WORK"/in-setup "$WORK"/go
+        "$WORK"/hold-setup "$WORK"/in-setup "$WORK"/go "$WORK"/snap-* "$WORK"/fail-start
     mkdir -p /opt/pialite/bin /var/lib/pialite "$(dirname "$MENU")" /usr/local/bin
     cat > /opt/pialite/bin/pialite-guard <<EOF
 #!/bin/sh
@@ -117,6 +135,7 @@ EOF
     ln -sf /opt/pialite/bin/pialite-guard /usr/local/bin/pialite-guard
     echo active > "$WORK/state"
     : > "$WORK/systemctl.log"
+    : > "$WORK/order.log"
 }
 run() {
     PATH="$WORK/fake:/usr/bin:/bin" PIALITE_ROLLBACK_WAIT=2 sh "$WORK/pkg/install.sh" "${1:---upgrade}" > "$WORK/out" 2>&1
@@ -255,12 +274,12 @@ check "killed while copying: old programs, settings, menu" is_old
 check "killed while copying: only an unfinished copy is left" all '[ -d /opt/pialite.rollback.part/bin ]' '[ ! -e /opt/pialite.rollback ]'
 run --restore-previous; rc=$?
 check "restore from an unfinished copy: refused" [ "$rc" = 1 ]
-check "restore from an unfinished copy: says so" said "is incomplete"
+check "restore from an unfinished copy: says so" said "is unfinished"
 check "restore from an unfinished copy: never stopped the guard" never_stopped
 check "restore from an unfinished copy: the programs in use untouched" is_old
 run; rc=$?
 check "upgrade after an unfinished copy: works" [ "$rc" = 0 ]
-check "upgrade after an unfinished copy: says it removed it" said "Removing an incomplete copy"
+check "upgrade after an unfinished copy: says it removed it" said "Removing an unfinished copy"
 check "upgrade after an unfinished copy: new programs" is_new
 check "upgrade after an unfinished copy: nothing left over" no_temp
 
@@ -294,14 +313,14 @@ check "killed mid-upgrade: nothing left over" no_temp
 # a copy an older installer left unfinished (no marker, empty last file): never used
 old; mkdir -m 0700 /opt/pialite.rollback && cp -a /opt/pialite/bin /opt/pialite.rollback/bin && : > /opt/pialite.rollback/before-dns
 run --restore-previous; rc=$?
-check "older unfinished copy: refused" all '[ "$rc" = 1 ]' 'said "incomplete - it is NOT used"'
+check "older unfinished copy: refused" all '[ "$rc" = 1 ]' 'said "incomplete or damaged - it is NOT used"'
 check "older unfinished copy: never stopped the guard" never_stopped
 check "older unfinished copy: programs untouched" is_old
 
 # another installer is running: refused before anything is looked at or changed (R10-04)
 for opt in --upgrade --uninstall --restore-previous; do
     old
-    exec 8>>"$LOCK"; flock -n 8
+    mkdir -p /run/pialite-install && chmod 0700 /run/pialite-install; exec 8>>"$LOCK"; flock -n 8
     run "$opt"; rc=$?
     exec 8>&-
     check "locked, $opt: refused" [ "$rc" = 1 ]
@@ -324,6 +343,133 @@ cp "$WORK/out-first" "$WORK/out"
 check "the first installer finishes: exit 0" [ "$rc" = 0 ]
 check "the first installer finishes: new programs" is_new
 check "the first installer finishes: nothing left over" no_temp
+
+# --- review V11 -------------------------------------------------------------
+
+# V11-01: the rename and the "guard-stopped" note are on disk before the stop
+old
+run; rc=$?
+check "barriers: upgrade works" [ "$rc" = 0 ]
+check "barriers: a sync after the rename, before the note" grep -q "sync part=0 roll=1 marker=0" "$WORK/order.log"
+check "barriers: the last sync before the stop saw the note in place" \
+    [ "$(sed -n '/systemctl stop/q;/^sync/p' "$WORK/order.log" | tail -1)" = "sync part=0 roll=1 marker=1" ]
+
+# V11-01: what a power cut can leave if the disk kept the program change but
+# not the rename / the note - the copy is never dropped as "nothing changed"
+# (a real kill after the programs were replaced, then the lost writes undone)
+lost_writes() { # $1 = rename | note
+    old; printf '%s' "pialite.new/bin" > "$WORK/kill-after-mv"; run
+    rm -f /opt/pialite.rollback/guard-stopped
+    [ "$1" = rename ] && mv /opt/pialite.rollback /opt/pialite.rollback.part
+    : > "$WORK/systemctl.log"
+}
+for lost in rename note; do
+    lost_writes $lost
+    run; rc=$?
+    check "lost $lost, programs already replaced: the upgrade refuses" all '[ "$rc" = 1 ]' 'said restore-previous'
+    check "lost $lost, programs already replaced: the copy is kept as the copy" all kept '[ ! -e /opt/pialite.rollback.part ]'
+    run --restore-previous; rc=$?
+    check "lost $lost, programs already replaced: restore-previous puts the old version back" \
+        all '[ "$rc" = 0 ]' is_old 'said "protects as before"' no_temp
+done
+lost_writes note
+run --restore-previous; rc=$?
+check "lost note: restore-previous restores - never 'nothing to put back'" all '[ "$rc" = 0 ]' is_old 'never_said "Nothing to put back"'
+
+# V11-02: a kept copy that lacks anything a restore needs, or no longer
+# matches its manifest: refused BEFORE the guard is stopped or a file removed
+kept_copy() { old; printf '%s' "pialite.new/bin" > "$WORK/kill-after-mv"; run; : > "$WORK/systemctl.log"; }
+for damage in "rm -f /opt/pialite.rollback/bin/pialite-tray" "rm -f /opt/pialite.rollback/before-mode" \
+    "rm -f /opt/pialite.rollback/install.json" "echo tampered >> /opt/pialite.rollback/bin/pialite-guard" \
+    "echo bogus > /opt/pialite.rollback/before-dns" "rm -f /opt/pialite.rollback/manifest"; do
+    kept_copy
+    eval "$damage"
+    # shellcheck disable=SC2034 # read in the check below (through all/eval)
+    live=$(cksum < /opt/pialite/bin/pialite-guard)
+    run --restore-previous; rc=$?
+    check "damaged copy ($damage): refused" all '[ "$rc" = 1 ]' 'said "incomplete or damaged"'
+    check "damaged copy ($damage): guard never stopped, programs in use untouched" \
+        all never_stopped '[ "$(cksum < /opt/pialite/bin/pialite-guard)" = "$live" ]'
+done
+# an older installer's copy (no marker, no manifest) missing a program: refused too
+kept_copy; rm -f /opt/pialite.rollback/complete /opt/pialite.rollback/manifest /opt/pialite.rollback/bin/pialite-tray
+run --restore-previous; rc=$?
+check "older copy missing a program: refused, never stopped" all '[ "$rc" = 1 ]' never_stopped
+# ...while an older installer's complete copy is still restorable
+kept_copy; rm -f /opt/pialite.rollback/complete /opt/pialite.rollback/manifest
+run --restore-previous; rc=$?
+check "older complete copy: restored" all '[ "$rc" = 0 ]' is_old
+
+# V11-04: --restore-previous when the stop fails: the restart is checked and
+# the copy always kept (nothing was put back)
+stopped_copy() { old; touch "$WORK/kill-after-marker-sync"; run; : > "$WORK/systemctl.log"; }
+stopped_copy; touch "$WORK/fail-stop-stopped" "$WORK/fail-start"
+run --restore-previous; rc=$?
+check "restore, stop fails, start fails: exit 1" [ "$rc" = 1 ]
+check "restore, stop fails, start fails: says the guard remains stopped" said "remains STOPPED"
+check "restore, stop fails, start fails: never 'protects as before'" never_said "protects as before"
+check "restore, stop fails, start fails: copy kept" kept
+stopped_copy; touch "$WORK/fail-stop-stopped"
+echo '{"version":"old","mode":"off","armed":false,"dns_only_guard":true}' > "$WORK/status-after"
+run --restore-previous; rc=$?
+check "restore, stop fails, back in Off: not confirmed, copy kept" \
+    all '[ "$rc" = 1 ]' 'said "Nothing was put back, but its protection could NOT be confirmed"' kept
+stopped_copy; touch "$WORK/fail-stop-stopped"
+run --restore-previous; rc=$?
+check "restore, stop fails, restarted fine: says so, still exit 1, copy kept" \
+    all '[ "$rc" = 1 ]' 'said "Nothing was put back, and its guard protects as before"' kept running
+# ...and the same start failure during an upgrade
+old; touch "$WORK/fail-stop-stopped" "$WORK/fail-start"
+run; rc=$?
+check "upgrade, stop fails, start fails: says so, copy kept" all '[ "$rc" = 1 ]' 'said "remains STOPPED"' kept is_old
+
+# V11-05: the lock can't be opened - so not held - by another account, whatever the umask
+old
+(umask 000; run); rc=$?
+check "lock under umask 000: upgrade works" [ "$rc" = 0 ]
+check "lock under umask 000: its folder is root's alone" [ "$(stat -c '%u %a' /run/pialite-install)" = "0 700" ]
+check "lock under umask 000: another account can't open it" \
+    all '! setpriv --reuid=65534 --regid=65534 --clear-groups flock -n /run/pialite-install/lock true 2>/dev/null'
+chmod 0777 /run/pialite-install; old; run
+check "lock folder left open by others: closed again" [ "$(stat -c %a /run/pialite-install)" = 700 ]
+rm -rf /run/pialite-install && : > /run/pialite-install; old
+run; rc=$?
+check "lock folder is a file: refused, nothing stopped" all '[ "$rc" = 1 ]' 'said "Could not set up the installer lock"' never_stopped is_old
+rm -f /run/pialite-install
+
+# V11-03: this test's own files are in its private /tmp
+: > "$WORK/out"
+check "work folder in the private /tmp" all 'case "$WORK" in /tmp/*) true ;; *) false ;; esac' \
+    'grep -q "^pialite-test /tmp tmpfs " /proc/self/mounts'
+
+# V11-01, for real: /opt on an ext4 disk image whose journal is written only
+# when something syncs (commit=600); copies of the image taken at the stop
+# and part-way through replacing the programs are exactly what a power cut
+# at that moment leaves. (Skipped where loop devices aren't available.)
+if command -v mkfs.ext4 >/dev/null 2>&1 && truncate -s 96M "$WORK/opt.img" && mkfs.ext4 -q -F "$WORK/opt.img" \
+    && mount -o loop,commit=600 "$WORK/opt.img" /opt 2>/dev/null; then
+    look() { mkdir -p "$WORK/look" && mount -o loop "$1" "$WORK/look"; } # replays the journal, like a reboot
+    old; /bin/sync
+    touch "$WORK/snap-stop"; printf '%s' "/usr/local/bin/pialite-tray" > "$WORK/snap-ln"
+    run; rc=$?
+    check "power cut: the upgrade itself works" [ "$rc" = 0 ]
+    look "$WORK/at-stop.img"
+    : > "$WORK/out"
+    check "power cut at the stop: the copy, its name and its note are on disk" \
+        all '[ -e "$WORK/look/pialite.rollback/complete" ]' '[ -e "$WORK/look/pialite.rollback/guard-stopped" ]' \
+        '[ ! -e "$WORK/look/pialite.rollback.part" ]'
+    umount "$WORK/look"
+    # "reboot" from the image taken while the programs were being replaced
+    umount /opt && mount -o loop,commit=600 "$WORK/at-ln.img" /opt
+    echo active > "$WORK/state"; : > "$WORK/systemctl.log"
+    run; rc=$?
+    check "power cut mid-upgrade: the next upgrade refuses" all '[ "$rc" = 1 ]' 'said restore-previous'
+    run --restore-previous; rc=$?
+    check "power cut mid-upgrade: restore-previous puts the old version back" all '[ "$rc" = 0 ]' is_old 'said "protects as before"'
+    umount /opt
+else
+    echo "SKIP: power-cut test (no loop device / mkfs.ext4 here)"
+fi
 
 # all fine
 old

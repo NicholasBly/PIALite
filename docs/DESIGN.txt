@@ -532,3 +532,14 @@ What is protected, from what, and what is NOT claimed.
    active, watch_guard + verdict; unknown earlier DNS = PARTIALLY VERIFIED.
    Tray: "Check for updates" menu item (check_update tells "up to date"
    from "couldn't check").
+   0.9.12 (review V11): durable() = checked sync after the rename to
+   $ROLL and after guard-stopped, before the stop. settle_copies: a
+   complete .part = lost rename -> renamed back; a complete copy without
+   guard-stopped is dropped only if programs_match (sha256 of both
+   programs). valid_copy (same test at snapshot and before any stop):
+   both programs, before-mode/-dns values, settings/menu/icon or absent
+   markers, manifest (sha256 of every file) when complete = 2.
+   after_failed_stop shared by upgrade and --restore-previous (start
+   checked; copy always kept in restore). Lock: /run/pialite-install/lock
+   in a 0700 root folder. Tests: /tmp hidden + TMPDIR; ext4 loop image
+   with commit=600 copied at the stop / mid-upgrade = power-cut states.

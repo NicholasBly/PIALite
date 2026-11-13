@@ -1,4 +1,4 @@
-# Sourced by the install.sh tests (reviews R98-01, N99-01, N99-07, R10-01):
+# Sourced by the install.sh tests (reviews R98-01, N99-01, N99-07, R10-01, V11-03):
 # they run ONLY in a fresh, private mount namespace where every place
 # install.sh or the tests can touch on a real system is an empty tmpfs.
 # Nothing a test does can reach a real installation, and it all vanishes when
@@ -8,20 +8,21 @@
 #  * WRITE folders - install.sh or the tests create files under them - must
 #    exist, be reached without a link, and be hidden. A missing one is
 #    refused BEFORE anything runs: the test would otherwise create it on the
-#    real system (R10-01).
+#    real system (R10-01). /tmp is one of them, and TMPDIR points there, so
+#    the tests' own work folders (mktemp) are private too (V11-03).
 #  * REMOVE-ONLY folders - install.sh only looks for and deletes files there -
 #    are hidden when they exist; when one doesn't, the test checks at the end
 #    that it still doesn't (still_isolated).
 #  * every absolute path install.sh names must be inside one of them (or be
 #    /bin/sh or /dev/null), and every path the calling test names inside a
-#    WRITE folder (or /bin, /usr/bin) - else refuse and name the folder to add.
+#    WRITE folder (or /bin, /usr/bin, /proc/self/mounts) - else refuse and name the folder to add.
 #  * the namespace must differ from the caller's and no mount may be shared
 #    (a shared mount would carry the tmpfs layers back out).
 # Needs root and unshare (util-linux). Can't isolate: refuse, never fall back.
-WRITE="/opt /usr/local /var/lib /run"
+WRITE="/opt /usr/local /var/lib /run /tmp"
 REMOVE_ONLY="/etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /etc/xdg/autostart"
 INSTALL_READ="/bin/sh /dev/null" # install.sh's interpreter and null device
-READ_ONLY="/bin /usr/bin /dev/null"  # system programs the tests run
+READ_ONLY="/bin /usr/bin /dev/null /proc/self/mounts" # system programs the tests run, and what they read
 INSTALL_SH="$HERE/../packaging/linux/install.sh"
 refuse() { echo "refusing: $*"; exit 1; }
 inside() { # inside PATH FOLDER... : 0 when PATH is one of the folders or under one
@@ -30,10 +31,10 @@ inside() { # inside PATH FOLDER... : 0 when PATH is one of the folders or under 
     return 1
 }
 # absolute paths a script names (not ones that only end a variable, like "$WORK/bin")
-paths_in() { grep -oE '(^|[^A-Za-z0-9_}).$-])/(etc|usr|var|opt|lib|srv|home|root|boot|run|mnt|media|bin|proc|dev|sbin)(/[A-Za-z0-9_.*-]+)*' "$1" | sed 's|^[^/]*||' | sort -u; }
+paths_in() { grep -oE '(^|[^A-Za-z0-9_}).$-])/(etc|usr|var|opt|lib|srv|home|root|boot|run|mnt|media|bin|proc|dev|sbin|tmp)(/[A-Za-z0-9_.*-]+)*' "$1" | sed 's|^[^/]*||' | sort -u; }
 
 case "$HERE" in
-    /opt/* | /usr/local/* | /var/lib/* | /run/* | /etc/*) refuse "run the tests from a checkout outside the folders they hide" ;;
+    /opt/* | /usr/local/* | /var/lib/* | /run/* | /tmp/* | /etc/*) refuse "run the tests from a checkout outside the folders they hide" ;;
 esac
 [ "$(id -u)" = 0 ] || refuse "run as root (sudo) - the test needs its own mount namespace"
 [ -f "$INSTALL_SH" ] || refuse "$INSTALL_SH not found"
@@ -86,6 +87,8 @@ done
 for d in $WRITE; do
     [ -z "$(ls -A "$d")" ] || refuse "$d is not empty after hiding it"
 done
+chmod 1777 /tmp
+export TMPDIR=/tmp # mktemp: the private /tmp, whatever the caller had set
 
 # For the test's last check: a remove-only folder that didn't exist still
 # doesn't (it would be on the real system - nothing hides it).

@@ -2,6 +2,37 @@
 
 All notable changes to PIA Lite. Versions follow [semantic versioning](https://semver.org).
 
+## [0.9.12] - 2026-11-13
+
+Fixes from the independent v0.9.11 review (V11-01 .. V11-06). Linux .tar.gz installer and its tests, plus one
+small tray hardening; nothing changes on Windows.
+
+### Fixed
+- **A power cut can't make the installer forget its copy** (V11-01): the copy's rename and the note "the guard is
+  being stopped" are now written to disk (checked `sync`) before the guard is stopped. And a complete copy is
+  dropped as "nothing changed" only when the installed programs are still byte-for-byte the ones in it - never
+  because a note is missing. A complete copy found under its temporary name (its rename was lost) is used as the
+  copy. A new test runs the upgrade on a real ext4 disk image and checks the image as a power cut at the stop, and
+  part-way through, would leave it.
+- **`--restore-previous` checks the whole copy before it stops anything** (V11-02): both programs, the guard's
+  earlier mode and DNS state (valid values), and every settings file, menu entry and icon (or the note that it
+  wasn't there). New copies also have a manifest (SHA-256 of every file), and every file must still match it. A
+  copy that fails is refused, and the guard is never stopped. Copies from 0.9.10 / 0.9.11 (no manifest) get the
+  structure check.
+- **The install.sh tests don't write to the real `/tmp`** (V11-03): `/tmp` is hidden like the other folders, and
+  `TMPDIR` points there. The preflight uses its own `/tmp` too (before, it left empty folders in the real one). CI
+  checks that nothing new appears in the real `/tmp`.
+- **A failed stop during `--restore-previous` is checked like in an upgrade** (V11-04): if the guard isn't running,
+  it is started again and that start is checked, then its protection is checked. The outcome is said plainly
+  ("protects as before", "could NOT be confirmed", or "remains STOPPED"). The copy is always kept, since nothing
+  was put back. An upgrade whose failed stop can't start the guard again now says so too.
+- **No other account can hold the installer lock** (V11-05): `flock` works on a file opened read-only, so the
+  0.9.11 lock file, readable by everyone, could be held by any account to block installs. The lock now lives in
+  `/run/pialite-install/`, a folder only root can enter (made 0700, closed again if it was opened up; refused if
+  it isn't root's or isn't a folder).
+- **Tray:** the update check reads the helper's output while it runs, keeping at most 64 KB per stream, so a
+  helper that writes a lot can't stall until the 90-second limit.
+
 ## [0.9.11] - 2026-11-12
 
 Fixes from the independent v0.9.10 review (R10-01 .. R10-06), and two requests.

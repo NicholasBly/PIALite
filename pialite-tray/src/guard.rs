@@ -109,30 +109,65 @@ pub fn parse_check(json: &str) -> Result<Option<Update>, String> {
 /// the menu never says "up to date" after a failed check.
 pub fn check_update() -> Result<Option<Update>, String> {
     let mut c = std::process::Command::new(guard_exe());
-    c.args(["check-update", "--json"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+    c.args(["check-update", "--json"]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000);
     }
-    let mut child = c.stdout(std::process::Stdio::piped()).spawn().map_err(|e| format!("could not run the guard program: {e}"))?;
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(90);
-    loop {
+    let (status, stdout, stderr) = run_capped(c, std::time::Duration::from_secs(90)).map_err(|e| match e {
+        RunError::Start(e) => format!("could not run the guard program: {e}"),
+        RunError::TooLong => "the update check took too long".into(),
+    })?;
+    if !status.success() {
+        return Err(failure_reason(&String::from_utf8_lossy(&stderr)));
+    }
+    parse_check(&String::from_utf8_lossy(&stdout))
+}
+
+/// Keep at most this much of each output stream (the answer is one line).
+const OUTPUT_CAP: usize = 64 * 1024;
+
+#[derive(Debug)]
+enum RunError {
+    Start(std::io::Error),
+    TooLong,
+}
+
+/// Run `c` with a deadline, reading stdout and stderr WHILE it runs (each
+/// kept up to OUTPUT_CAP, the rest read and dropped) - so a program that
+/// writes more than a pipe holds can't stall until the deadline (review V11).
+fn run_capped(mut c: std::process::Command, limit: std::time::Duration) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), RunError> {
+    use std::io::Read;
+    use std::process::Stdio;
+    fn drain(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let (mut kept, mut chunk) = (Vec::new(), [0u8; 8192]);
+            while let Ok(n) = r.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                let room = OUTPUT_CAP - kept.len();
+                kept.extend_from_slice(&chunk[..n.min(room)]);
+            }
+            kept
+        })
+    }
+    let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(RunError::Start)?;
+    let (out, err) = (drain(child.stdout.take().expect("piped")), drain(child.stderr.take().expect("piped")));
+    let until = std::time::Instant::now() + limit;
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(50)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("the update check took too long".into());
+                return Err(RunError::TooLong); // the readers end when the pipes close; not waited for
             }
         }
-    }
-    let out = child.wait_with_output().map_err(|e| format!("update check: {e}"))?;
-    if !out.status.success() {
-        return Err(failure_reason(&String::from_utf8_lossy(&out.stderr)));
-    }
-    parse_check(&String::from_utf8_lossy(&out.stdout))
+    };
+    Ok((status, out.join().unwrap_or_default(), err.join().unwrap_or_default()))
 }
 
 /// The guard program's last error line, for the tray log.
@@ -274,6 +309,26 @@ mod tests {
             "send: invalid peer certificate: UnknownIssuer"
         );
         assert_eq!(failure_reason(""), "no reason given");
+    }
+
+    /// A helper that writes far more than a pipe holds (on both streams)
+    /// still finishes at once, its output capped; one that hangs is stopped.
+    #[cfg(unix)]
+    #[test]
+    fn helper_output_is_read_while_it_runs_and_capped() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "head -c 1000000 /dev/zero | tr '\\0' x >&2; head -c 300000 /dev/zero; echo done >&2"]);
+        let t = std::time::Instant::now();
+        let (status, out, err) = run_capped(c, std::time::Duration::from_secs(20)).expect("ran");
+        assert!(status.success());
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "did not stall on a full pipe");
+        assert_eq!(out.len(), OUTPUT_CAP);
+        assert_eq!(err.len(), OUTPUT_CAP, "the rest was read and dropped");
+        let mut hang = std::process::Command::new("sh");
+        hang.args(["-c", "sleep 30"]);
+        let t = std::time::Instant::now();
+        assert!(matches!(run_capped(hang, std::time::Duration::from_millis(500)), Err(RunError::TooLong)));
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
         let odd = parse_update(r#"{"latest":"9.9.9","newer":true,"page":"https://evil.example/"}"#).unwrap();
         assert!(odd.page.starts_with("https://github.com/"), "only GitHub pages are opened");
         assert!(safe_arg("guard,dns,hotel") && safe_arg("S-1-5-21-1-2-3") && safe_arg("abc123"));

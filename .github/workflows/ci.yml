@@ -45,13 +45,15 @@ jobs:
       # untouched afterwards - also when the tests are started from a namespace
       # whose mounts are shared (reviews R98-01, N99-01, N99-07). And in
       # throwaway roots missing a folder the tests write under, they must
-      # refuse before creating it (R10-01).
+      # refuse before creating it (R10-01). Nothing new may appear in the real
+      # /tmp either: the tests' own work folders are private (V11-03).
       - name: install.sh tests (uninstall checks, upgrade rollback) - isolated from real files
         run: |
           sentinels="/opt/pialite/MARKER /etc/xdg/autostart/pialite-tray.desktop /usr/local/bin/pialite-guard \
             /usr/local/share/applications/pialite.desktop /var/lib/pialite/guard.json /etc/systemd/system/pialite-guard.service \
-            /run/pialite-install.lock"
+            /run/pialite-install/lock /tmp/pialite-sentinel"
           for f in $sentinels; do sudo mkdir -p "$(dirname "$f")"; echo sentinel | sudo tee "$f" >/dev/null; done
+          sudo find /tmp -mindepth 1 -maxdepth 1 -user root | sort > "$RUNNER_TEMP/tmp-before"
           sudo sh tests/isolate-preflight.sh
           sudo sh tests/install-sh-uninstall.sh
           sudo sh tests/install-sh-upgrade.sh
@@ -60,8 +62,11 @@ jobs:
             test "$(sudo cat "$f" 2>/dev/null)" = sentinel || { echo "a test touched the real $f"; exit 1; }
           done
           if grep -q -e pialite-test -e preflight /proc/self/mounts; then echo "a test's mounts leaked out"; exit 1; fi
+          sudo find /tmp -mindepth 1 -maxdepth 1 -user root | sort > "$RUNNER_TEMP/tmp-after"
+          if comm -13 "$RUNNER_TEMP/tmp-before" "$RUNNER_TEMP/tmp-after" | grep .; then echo "a test left files in the real /tmp (above)"; exit 1; fi
+          if sudo losetup -a | grep -q opt.img; then echo "a test left a loop device attached"; exit 1; fi
           for f in $sentinels; do sudo rm -f "$f"; done
-          sudo rmdir /opt/pialite /var/lib/pialite 2>/dev/null || true
+          sudo rmdir /opt/pialite /var/lib/pialite /run/pialite-install 2>/dev/null || true
       - name: Packages (.deb, .rpm, .tar.gz)
         run: packaging/linux/build-packages.sh "$(grep -m1 '^version' pialite-guard/Cargo.toml | cut -d'"' -f2)"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
