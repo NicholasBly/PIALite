@@ -1520,7 +1520,7 @@ mod tests {
     #[test]
     fn check_rules_never_reads_cant_look_as_none() {
         // review V3-01
-        let _g = crate::config::tests::ENV_LOCK.lock().unwrap();
+        let _g = crate::config::tests::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::firewall::fail_inspect(true);
         let r = super::check_rules();
         crate::firewall::fail_inspect(false);
@@ -1532,7 +1532,7 @@ mod tests {
     #[test]
     fn show_rules_fails_on_a_difference() {
         // review V4-05: CHECK-DIFF must also mean a non-zero exit
-        let _g = crate::config::tests::ENV_LOCK.lock().unwrap();
+        let _g = crate::config::tests::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = crate::config::tests::temp_data("showrules");
         std::env::set_var("PIALITE_IPC_PORT", "1"); // no guard answering: use the saved settings
         let rules = crate::firewall::plan(&crate::pia::engine_exes(), false);
@@ -1562,7 +1562,7 @@ mod tests {
     /// wanted, exit 0; no settings but rules in Windows -> they count.
     #[test]
     fn show_rules_offline_without_settings() {
-        let _g = crate::config::tests::ENV_LOCK.lock().unwrap();
+        let _g = crate::config::tests::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = crate::config::tests::temp_data("showrules-clean");
         std::env::set_var("PIALITE_IPC_PORT", "1"); // no guard answering
         crate::firewall::uninstall().unwrap();

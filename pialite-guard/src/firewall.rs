@@ -2443,7 +2443,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn value_tampering_and_uninspectable_state() {
-        let _g = crate::config::tests::ENV_LOCK.lock().unwrap();
+        let _g = crate::config::tests::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let want = install(&plan(&apps(), true)).unwrap();
         assert!(verify(&want).is_ok());
         // same key, same count, different value -> noticed (V3-05)

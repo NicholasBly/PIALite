@@ -771,6 +771,8 @@ pub mod tests {
     use std::sync::Mutex;
 
     /// Tests that touch PIALITE_DATA take this lock (env vars are process-wide).
+    /// Taken with `unwrap_or_else(PoisonError::into_inner)`: one failing test
+    /// must not fail every later one ("PoisonError") and hide what broke.
     pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     pub fn temp_data(name: &str) -> PathBuf {
@@ -862,7 +864,7 @@ pub mod tests {
 
     #[test]
     fn hotel_recovery_record() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("recovery");
         assert_eq!(load_recovery(), RecoveryState::None);
         let r = Recovery::new(3, "on");
@@ -910,7 +912,7 @@ pub mod tests {
 
     #[test]
     fn corrupt_config_fails_closed() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("cfg");
         // fresh install
         assert!(matches!(load(|| false), Loaded::Fresh(_)));

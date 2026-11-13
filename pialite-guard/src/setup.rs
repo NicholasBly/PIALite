@@ -1265,7 +1265,7 @@ mod tests {
     fn data_files_are_root_only_whatever_the_umask() {
         // review F-06
         use std::os::unix::fs::PermissionsExt;
-        let _g = config::tests::ENV_LOCK.lock().unwrap();
+        let _g = config::tests::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = config::tests::temp_data("modes");
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let old = unsafe { libc::umask(0o022) };
@@ -1358,7 +1358,7 @@ mod tests {
         let st = wait_ready(&|_| Ok(before.clone()), &unknown_dns, short).unwrap();
         assert!(judge_recovery(&unknown_dns, &st).unwrap().contains("saved settings only"));
         // and the message never says "back" without it
-        let _g = config::tests::ENV_LOCK.lock().unwrap();
+        let _g = config::tests::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut rep = Report { lines: vec![], warnings: vec![] };
         firewall::fail_next_uninstall();
         let e = remove_firewall_parts(&mut rep, &|| Err("didn't answer".into())).unwrap_err();
@@ -1369,7 +1369,7 @@ mod tests {
     fn a_failed_guard_removal_puts_the_previous_settings_back_first() {
         // review R98-04: setup saved the new settings (Off, no DNS) before the
         // guard was removed; the guard must restart with the OLD ones
-        let _g = config::tests::ENV_LOCK.lock().unwrap();
+        let _g = config::tests::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = config::tests::temp_data("prior");
         let prior = Config { mode: BlockMode::Always, features: Some(config::Features { dns: true, hotel: true }), ..Default::default() };
         let new = Config { mode: BlockMode::Off, features: Some(config::Features { dns: false, hotel: false }), ..Default::default() };
@@ -1391,7 +1391,7 @@ mod tests {
     fn removing_the_guard_feature_keeps_the_protected_order() {
         // review G97-01: the service goes last; a failed firewall step brings
         // the guard back instead of leaving rules with nobody to look after them
-        let _g = config::tests::ENV_LOCK.lock().unwrap();
+        let _g = config::tests::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut rep = Report { lines: vec![], warnings: vec![] };
         let order = std::cell::RefCell::new(vec![]);
         let stop = || {
@@ -1465,7 +1465,7 @@ mod tests {
     fn a_failed_teardown_step_starts_the_guard_again() {
         // review F-02: DNS redirect first, the block after; any failure restarts
         // the guard (which puts its rules back) and says so
-        let _g = config::tests::ENV_LOCK.lock().unwrap();
+        let _g = config::tests::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut rep = Report { lines: vec![], warnings: vec![] };
         let restarted = std::cell::Cell::new(0);
         let restart = || {

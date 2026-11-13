@@ -1767,7 +1767,7 @@ esac
 
     #[test]
     fn modes_status_and_drift_repair() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("guard");
         let g = Guard::start_with(free_addr(), false);
         let st = g.status();
@@ -1905,7 +1905,7 @@ esac
     /// it never connects without PIA reporting Disconnected first; one at a time.
     #[test]
     fn a_queued_restart_only_acts_on_the_same_stuck_attempt() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("kick");
         let g = Guard::start_with(free_addr(), false);
         g.handle("mode always", false).unwrap();
@@ -2007,7 +2007,7 @@ esac
     /// started, or the user pressed Disconnect.
     #[test]
     fn a_restart_waiting_its_turn_checks_again() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("kickqueue");
         let g = Guard::start_with(free_addr(), false);
         g.handle("mode always", false).unwrap();
@@ -2077,7 +2077,7 @@ esac
     #[cfg(unix)] // the fake piactl is a shell script
     #[test]
     fn hotel_reconnect_waits_its_turn_and_checks_again() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("hotelqueue");
         let pia = FakePia::new(&d);
         let g = Guard::start_with(free_addr(), false);
@@ -2118,7 +2118,7 @@ esac
     /// connected again after the login.
     #[test]
     fn hotel_return_does_not_trust_a_report_from_before_it_ended() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _quiet = NoTick::new();
         let d = temp_data("hotelstale");
         let g = Guard::start_with(free_addr(), false);
@@ -2186,7 +2186,7 @@ esac
     /// Connect; and a retry never goes against a newer login or a Disconnect.
     #[test]
     fn hotel_return_retries_a_failed_connect_and_says_so() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _quiet = NoTick::new();
         let d = temp_data("hotelretry");
         let g = Guard::start_with(free_addr(), false);
@@ -2268,7 +2268,7 @@ esac
     #[cfg(unix)] // the fake piactl is a shell script
     #[test]
     fn hotel_entry_waits_its_turn_at_pia_commands() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _quiet = NoTick::new();
         let d = temp_data("hotelentry");
         let pia = FakePia::new(&d);
@@ -2312,7 +2312,7 @@ esac
         // VERIFIED rules count as protection, but whenever PIA Lite rules are
         // (or may be) in Windows the VPN-connected allow-all is still added.
         use firewall::{Cond, FilterSpec, Kind};
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _quiet = NoTick::new();
         let d = temp_data("refreshfail");
         let g = Guard::start_with(free_addr(), false);
@@ -2391,7 +2391,7 @@ esac
     #[test]
     fn mode_change_applies_before_saving_and_reverts_on_failure() {
         // review N-14
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("modefail");
         let g = Guard::start_with(free_addr(), false);
         firewall::fail_next_install();
@@ -2422,7 +2422,7 @@ esac
     fn dns_block_state_counts_only_what_the_firewall_confirmed() {
         // review V95-01: a failed add/remove/check is never reported as "on",
         // is visible in the status, and is tried again
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("dnsblock");
         let mut c = Config { features: Some(config::Features { dns: true, hotel: true }), ..Default::default() };
         c.set_provider("quad9", None).unwrap();
@@ -2469,7 +2469,7 @@ esac
 
     #[test]
     fn optional_features_are_honoured() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("features");
         let c = Config { features: Some(config::Features { dns: false, hotel: false }), ..Default::default() };
         config::save(&c).unwrap();
@@ -2478,7 +2478,11 @@ esac
         std::thread::sleep(Duration::from_millis(300));
         let st = g.status();
         assert!(!st.dns.listening && st.dns.bind_error.contains("turned off"), "{:?}", st.dns);
-        assert!(std::net::UdpSocket::bind(addr).is_ok(), "port 53 (test port) left free");
+        // the guard left the port (53 in real use) free. Another test - or
+        // program - may be handed the same free port meanwhile (seen on
+        // Windows CI), so a taken port only counts against the guard if it
+        // is free again once the guard has stopped.
+        let free_while_running = std::net::UdpSocket::bind(addr).is_ok();
         assert_eq!(st.features, Some(vec![]));
         assert_eq!(st.dns_provider, "");
         let e = g.handle("hotel start", true).unwrap_err();
@@ -2486,6 +2490,9 @@ esac
         assert!(!g.status().hotel);
         g.shutdown();
         drop(g);
+        if !free_while_running {
+            assert!(std::net::UdpSocket::bind(addr).is_err(), "the guard held the test port (53) with DNS turned off");
+        }
         // DNS on with Quad9, hotel on
         let mut c = Config { features: Some(config::Features { dns: true, hotel: true }), ..Default::default() };
         c.set_provider("quad9", None).unwrap();
@@ -2510,7 +2517,7 @@ esac
     #[test]
     fn hotel_exit_reblocks_restores_then_reconnects() {
         // review N-02 / N-06, manual stop and timer, restore OK and failing
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("hotelcycle");
         let pia = FakePia::new(&d);
         let g = Guard::start_with(free_addr(), false);
@@ -2589,7 +2596,7 @@ esac
     #[test]
     fn late_timer_never_ends_a_newer_hotel_login() {
         // review V3-02: the timer's worker of login #1 runs only after login #2 started
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("hotelgen");
         let pia = FakePia::new(&d);
         let g = Guard::start_with(free_addr(), false);
@@ -2629,7 +2636,7 @@ esac
     fn nothing_opens_during_restore_and_off_mode_blocks_until_restored() {
         // review V3-03 (Connected arrives mid-restore) and V3-10 (block off,
         // PIA's kill switch on, restore fails)
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("hotelrestore");
         let pia = FakePia::new(&d);
         let g = Guard::start_with(free_addr(), false);
@@ -2668,7 +2675,7 @@ esac
     #[test]
     fn commands_wait_a_bounded_time_and_same_mode_is_not_reinstalled() {
         // review V3-06
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("busy");
         let g = Guard::start_with(free_addr(), false);
         g.handle("mode always", false).unwrap();
@@ -2692,7 +2699,7 @@ esac
     fn a_stale_open_decision_cannot_reopen_after_a_block() {
         // review V4-02: T1 decides "open" (hotel login on); before it acts, T2
         // ends the hotel login. The allow-all must not survive.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("stale");
         let g = Guard::start_with(free_addr(), false);
         g.handle("mode always", false).unwrap();
@@ -2722,7 +2729,7 @@ esac
     #[test]
     fn a_due_timer_does_not_end_a_login_started_since() {
         // review V4-01, through the guard: #1 is due, #2 starts before the tick
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("hoteldue");
         let pia = FakePia::new(&d);
         let g = Guard::start_with(free_addr(), false);
@@ -2752,7 +2759,7 @@ esac
     fn recovery_record_survives_a_stale_settings_backup() {
         // review V4-03: guard.json is lost during a hotel login; its .bak is
         // older and says "no hotel login". The restore must still happen.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("stalebak");
         let pia = FakePia::new(&d);
         let g = Guard::start_with(free_addr(), false);
@@ -2788,7 +2795,7 @@ esac
     fn restore_reports_a_firewall_sync_failure() {
         // review V4-06: PIA's kill switch is back, but the guard's rules can't
         // be brought in line (block off: they should go) - not "all done"
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("syncfail");
         let pia = FakePia::new(&d);
         let g = Guard::start_with(free_addr(), false);
@@ -2809,7 +2816,7 @@ esac
     #[test]
     fn vpn_adapter_going_down_blocks_even_if_pia_says_connected() {
         // review V4-12, F51-07
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _quiet = NoTick::new();
         let d = temp_data("tunnel");
         let g = Guard::start_with(free_addr(), false);
@@ -2858,7 +2865,7 @@ esac
 
     #[test]
     fn waits_for_a_network_before_asking_pia_to_connect() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _quiet = NoTick::new();
         let d = temp_data("netwait");
         crate::netif::set_test_snapshot(crate::netif::Snapshot { pia: vec![], network: None });
@@ -2885,7 +2892,7 @@ esac
 
     #[test]
     fn hotel_start_failure_rolls_back() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = temp_data("hotel");
         std::env::set_var("PIALITE_PIACTL", "/nonexistent/piactl");
         let g = Guard::start_with(free_addr(), false);

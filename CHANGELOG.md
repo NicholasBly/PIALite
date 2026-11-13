@@ -32,6 +32,9 @@ small tray hardening; nothing changes on Windows.
   it isn't root's or isn't a folder).
 - **Tray:** the update check reads the helper's output while it runs, keeping at most 64 KB per stream, so a
   helper that writes a lot can't stall until the 90-second limit.
+- **Tests:** `optional_features_are_honoured` no longer fails when another test is handed the same free port
+  (seen once on Windows CI); a taken port only counts against the guard if it is free once the guard has stopped.
+  And one failing test no longer poisons the shared test lock and fails every later test with it.
 
 ## [0.9.11] - 2026-11-12
 
